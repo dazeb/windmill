@@ -34,6 +34,7 @@ pub enum ScriptLang {
     Powershell,
     Postgresql,
     Bun,
+    Bunnative,
     Mysql,
     Bigquery,
     Snowflake,
@@ -46,6 +47,7 @@ impl ScriptLang {
     pub fn as_str(&self) -> &'static str {
         match self {
             ScriptLang::Bun => "bun",
+            ScriptLang::Bunnative => "bunnative",
             ScriptLang::Nativets => "nativets",
             ScriptLang::Deno => "deno",
             ScriptLang::Python3 => "python3",
@@ -131,6 +133,7 @@ impl Display for ScriptKind {
 }
 
 pub const PREVIEW_IS_CODEBASE_HASH: i64 = -42;
+pub const PREVIEW_IS_TAR_CODEBASE_HASH: i64 = -43;
 
 #[derive(Serialize, sqlx::FromRow)]
 pub struct Script {
@@ -148,6 +151,7 @@ pub struct Script {
     pub deleted: bool,
     pub is_template: bool,
     pub extra_perms: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lock: Option<String>,
     pub lock_error_logs: Option<String>,
     pub language: ScriptLang,
@@ -206,6 +210,9 @@ pub struct ListableScript {
     pub no_main_func: Option<bool>,
     #[serde(skip_serializing_if = "is_false")]
     pub use_codebase: bool,
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_msg: Option<String>,
 }
 
 fn is_false(x: &bool) -> bool {
@@ -338,6 +345,7 @@ pub struct ListScriptQuery {
     pub starred_only: Option<bool>,
     pub include_without_main: Option<bool>,
     pub include_draft_only: Option<bool>,
+    pub with_deployment_msg: Option<bool>,
 }
 
 pub fn to_i64(s: &str) -> crate::error::Result<i64> {

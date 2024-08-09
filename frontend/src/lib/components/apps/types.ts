@@ -1,5 +1,5 @@
 import type { Schema } from '$lib/common'
-import type { Preview } from '$lib/gen'
+import type { Policy, Preview } from '$lib/gen'
 import type { History } from '$lib/history'
 
 import type { Writable } from 'svelte/store'
@@ -154,11 +154,13 @@ export type App = {
 		name: string
 		inlineScript: InlineScript
 	}>
+
 	//TODO: should be called hidden runnables but migration tbd
 	hiddenInlineScripts: Array<HiddenRunnable>
 	css?: Partial<Record<AppCssItemName, Record<string, ComponentCssProperty>>>
 	subgrids?: Record<string, GridItem[]>
 	theme: AppTheme | undefined
+	hideLegacyTopBar?: boolean | undefined
 }
 
 export type ConnectingInput = {
@@ -260,6 +262,7 @@ export type AppViewerContext = {
 				clearFiles?: () => void
 				showToast?: (message: string, error?: boolean) => void
 				recompute?: () => void
+				askNewResource?: () => void
 			}
 		>
 	>
@@ -269,6 +272,19 @@ export type AppViewerContext = {
 	cssEditorOpen: Writable<boolean>
 	previewTheme: Writable<string | undefined>
 	debuggingComponents: Writable<Record<string, number>>
+	replaceStateFn?: ((url: string) => void) | undefined
+	gotoFn?: ((url: string, opt?: Record<string, any> | undefined) => void) | undefined
+	policy: Policy
+
+	recomputeAllContext: Writable<{
+		onClick?: () => void
+		componentNumber?: number | undefined
+		interval?: number | undefined
+		refreshing?: string[] | undefined
+		setInter?: (interval: number) => void | undefined
+		progress?: number | undefined
+		loading?: boolean | undefined
+	}>
 }
 
 export type AppEditorContext = {

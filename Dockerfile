@@ -1,5 +1,5 @@
 ARG DEBIAN_IMAGE=debian:bookworm-slim
-ARG RUST_IMAGE=rust:1.78-slim-bookworm
+ARG RUST_IMAGE=rust:1.79-slim-bookworm
 ARG PYTHON_IMAGE=python:3.11.8-slim-bookworm
 
 FROM ${RUST_IMAGE} AS rust_base
@@ -41,6 +41,7 @@ COPY /typescript-client/docs/ /frontend/static/tsdocs/
 
 RUN npm run generate-backend-client
 ENV NODE_OPTIONS "--max-old-space-size=8192"
+ARG VITE_BASE_URL ""
 RUN npm run build
 
 
@@ -126,13 +127,13 @@ RUN set -eux; \
     arch="$(dpkg --print-architecture)"; arch="${arch##*-}"; \
     case "$arch" in \
     'amd64') \
-    targz='go1.21.6.linux-amd64.tar.gz'; \
+    targz='go1.22.5.linux-amd64.tar.gz'; \
     ;; \
     'arm64') \
-    targz='go1.21.6.linux-arm64.tar.gz'; \
+    targz='go1.22.5.linux-arm64.tar.gz'; \
     ;; \
     'armhf') \
-    targz='go1.21.6.linux-armv6l.tar.gz'; \
+    targz='go1.22.5.linux-armv6l.tar.gz'; \
     ;; \
     *) echo >&2 "error: unsupported architecture '$arch' (likely packaging update needed)"; exit 1 ;; \
     esac; \
@@ -154,9 +155,9 @@ RUN /usr/local/bin/python3 -m pip install pip-tools
 COPY --from=builder /frontend/build /static_frontend
 COPY --from=builder /windmill/target/release/windmill ${APP}/windmill
 
-COPY --from=denoland/deno:1.44.4 --chmod=755 /usr/bin/deno /usr/bin/deno
+COPY --from=denoland/deno:1.45.4 --chmod=755 /usr/bin/deno /usr/bin/deno
 
-COPY --from=oven/bun:1.1.8 /usr/local/bin/bun /usr/bin/bun
+COPY --from=oven/bun:1.1.21 /usr/local/bin/bun /usr/bin/bun
 
 COPY --from=php:8.3.7-cli /usr/local/bin/php /usr/bin/php
 COPY --from=composer:2.7.6 /usr/bin/composer /usr/bin/composer

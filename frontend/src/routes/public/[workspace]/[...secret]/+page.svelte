@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { BROWSER } from 'esm-env'
 	import { page } from '$app/stores'
+	import { base } from '$lib/base'
 	import AppPreview from '$lib/components/apps/editor/AppPreview.svelte'
 	import { IS_APP_PUBLIC_CONTEXT_KEY, type EditorBreakpoint } from '$lib/components/apps/types'
 
@@ -17,6 +18,7 @@
 	import Login from '$lib/components/Login.svelte'
 	import { getUserExt } from '$lib/user'
 	import { User, UserRoundX } from 'lucide-svelte'
+	import { goto, replaceState } from '$app/navigation'
 
 	let app: (AppWithLastVersion & { value: any }) | undefined = undefined
 	let notExists = false
@@ -29,6 +31,8 @@
 				workspace: $page.params.workspace,
 				path: $page.params.secret
 			})
+			noPermission = false
+			notExists = false
 		} catch (e) {
 			if (e.status == 401) {
 				noPermission = true
@@ -40,8 +44,9 @@
 
 	if (BROWSER) {
 		setLicense()
-		loadApp()
-		loadUser()
+		loadUser().then(() => {
+			loadApp()
+		})
 	}
 
 	async function loadUser() {
@@ -84,7 +89,7 @@
 {#if notExists}
 	<div class="px-4 mt-20"
 		><Alert type="error" title="Not found"
-			>There was an error loading the app, is the url correct? <a href="/">Go to Windmill</a>
+			>There was an error loading the app, is the url correct? <a href={base}>Go to Windmill</a>
 		</Alert></div
 	>
 {:else if noPermission}
@@ -93,7 +98,17 @@
 			in and have read access for this app{/if}</div
 	>
 	<div class="px-2 mx-auto mt-20 max-w-xl w-full">
-		<Login rd={$page.url.toString()} />
+		<Login
+			on:login={() => {
+				// window.location.reload()
+				loadUser().then(() => {
+					loadApp()
+				})
+				app = app
+			}}
+			popup
+			rd={$page.url.toString()}
+		/>
 	</div>
 {:else if app}
 	{#key app}
@@ -121,6 +136,8 @@
 				{breakpoint}
 				policy={app.policy}
 				isEditor={false}
+				replaceStateFn={(path) => replaceState(path, $page.state)}
+				gotoFn={(path, opt) => goto(path, opt)}
 			/>
 		</div>
 	{/key}

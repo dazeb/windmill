@@ -1,5 +1,6 @@
 pub const CUSTOM_TAGS_SETTING: &str = "custom_tags";
 pub const DEFAULT_TAGS_PER_WORKSPACE_SETTING: &str = "default_tags_per_workspace";
+pub const DEFAULT_TAGS_WORKSPACES_SETTING: &str = "default_tags_workspaces";
 pub const BASE_URL_SETTING: &str = "base_url";
 pub const OAUTH_SETTING: &str = "oauths";
 pub const RETENTION_PERIOD_SECS_SETTING: &str = "retention_period_secs";
@@ -27,6 +28,7 @@ pub const HUB_BASE_URL_SETTING: &str = "hub_base_url";
 pub const CRITICAL_ERROR_CHANNELS_SETTING: &str = "critical_error_channels";
 pub const DEV_INSTANCE_SETTING: &str = "dev_instance";
 pub const JWT_SECRET_SETTING: &str = "jwt_secret";
+pub const EMAIL_DOMAIN_SETTING: &str = "email_domain";
 
 pub const ENV_SETTINGS: [&str; 50] = [
     "DISABLE_NSJAIL",

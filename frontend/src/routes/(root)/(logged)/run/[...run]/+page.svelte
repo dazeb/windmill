@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/stores'
+	import { base } from '$lib/base'
 	import {
 		JobService,
 		type Job,
@@ -11,6 +12,7 @@
 	} from '$lib/gen'
 	import {
 		canWrite,
+		computeSharableHash,
 		copyToClipboard,
 		displayDate,
 		emptyString,
@@ -43,7 +45,7 @@
 	import DisplayResult from '$lib/components/DisplayResult.svelte'
 	import {
 		enterpriseLicense,
-		runFormStore,
+		initialArgsStore,
 		superadmin,
 		userStore,
 		userWorkspaces,
@@ -69,7 +71,7 @@
 	import Tabs from '$lib/components/common/tabs/Tabs.svelte'
 	import Badge from '$lib/components/common/badge/Badge.svelte'
 	import Tooltip from '$lib/components/Tooltip.svelte'
-	import { goto } from '$app/navigation'
+	import { goto } from '$lib/navigation'
 	import { sendUserToast } from '$lib/toast'
 	import { forLater } from '$lib/forLater'
 	import ButtonDropdown from '$lib/components/common/button/ButtonDropdown.svelte'
@@ -256,12 +258,14 @@
 
 	function forkPreview() {
 		if (job?.job_kind == 'flowpreview') {
+			$initialArgsStore = job?.args
 			const state = {
 				flow: { value: job?.raw_flow },
 				path: job?.script_path + '_fork'
 			}
 			window.open(`/flows/add#${encodeState(state)}`)
 		} else {
+			$initialArgsStore = job?.args
 			let n: NewScript = {
 				path: job?.script_path + '_fork',
 				summary: 'Fork of preview of ' + job?.script_path,
@@ -347,7 +351,7 @@
 					</div>
 				{/each}
 				<div>
-					<Button href="/runs">Go to runs page</Button>
+					<Button href="{base}/runs">Go to runs page</Button>
 				</div>
 			</div>
 		</div>
@@ -564,8 +568,7 @@
 			{#if job?.job_kind === 'script' || job?.job_kind === 'flow'}
 				<Button
 					on:click|once={() => {
-						$runFormStore = job?.args
-						goto(viewHref)
+						goto(viewHref + `#${computeSharableHash(job?.args)}`)
 					}}
 					color="blue"
 					size="sm"
@@ -577,7 +580,7 @@
 					{#if canWrite(job?.script_path ?? '', {}, $userStore)}
 						<Button
 							on:click|once={() => {
-								$runFormStore = job?.args
+								$initialArgsStore = job?.args
 								goto(`${stem}/edit/${job?.script_path}${isScript ? `` : `?nodraft=true`}`)
 							}}
 							color="blue"
@@ -624,7 +627,7 @@
 					{job.script_path ?? (job.job_kind == 'dependencies' ? 'lock dependencies' : 'No path')}
 					<div class="flex flex-row gap-2 items-center flex-wrap">
 						{#if job.script_hash}
-							<a href="/scripts/get/{job.script_hash}?workspace={$workspaceStore}"
+							<a href="{base}/scripts/get/{job.script_hash}?workspace={$workspaceStore}"
 								><Badge color="gray">{truncateHash(job.script_hash)}</Badge></a
 							>
 						{/if}
@@ -670,13 +673,13 @@
 									<svelte:fragment slot="text">
 										This job has concurrency limits enabled with the key
 										<a
-											href={`/runs/?job_kinds=all&graph=ConcurrencyChart&concurrency_key=${concurrencyKey}`}
+											href={`${base}/runs/?job_kinds=all&graph=ConcurrencyChart&concurrency_key=${concurrencyKey}`}
 										>
 											{concurrencyKey}
 										</a>
 									</svelte:fragment>
 									<a
-										href={`/runs/?job_kinds=all&graph=ConcurrencyChart&concurrency_key=${concurrencyKey}`}
+										href={`${base}/runs/?job_kinds=all&graph=ConcurrencyChart&concurrency_key=${concurrencyKey}`}
 									>
 										<Badge>Concurrency: {truncateRev(concurrencyKey, 20)}</Badge></a
 									>
@@ -688,10 +691,12 @@
 			</div>
 		</h1>
 		{#if job?.['deleted']}
-			<Alert type="error" title="Deleted">
-				The content of this run was deleted (by an admin, no less)
-			</Alert>
-			<div class="my-2" />
+			<div class="max-w-7xl mx-auto w-full px-4">
+				<Alert type="error" title="Deleted">
+					The content of this run was deleted (by an admin, no less)
+				</Alert>
+			</div>
+			<div class="my-4" />
 		{/if}
 
 		<!-- Arguments and actions -->
@@ -699,7 +704,11 @@
 			class="flex flex-col gap-y-8 sm:grid sm:grid-cols-3 sm:gap-10 max-w-7xl mx-auto w-full px-4"
 		>
 			<div class="col-span-2">
-				<JobArgs args={job?.args} />
+				<JobArgs
+					workspace={job?.workspace_id ?? $workspaceStore ?? 'no_w'}
+					id={job?.id}
+					args={job?.args}
+				/>
 			</div>
 			<div>
 				<Skeleton loading={!job} layout={[[9.5]]} />

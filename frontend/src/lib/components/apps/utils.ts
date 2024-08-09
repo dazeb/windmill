@@ -1,7 +1,7 @@
 import type { Schema } from '$lib/common'
 
 import { twMerge } from 'tailwind-merge'
-import type { AppComponent } from './editor/component'
+import { type AppComponent } from './editor/component'
 import type { AppInput, InputType, ResultAppInput, StaticAppInput } from './inputType'
 import type { Output } from './rx'
 import type {
@@ -258,6 +258,20 @@ declare function clearFiles(id: string): void;
  * @param message message to display
  */
 declare function showToast(message: string, error?: boolean): void;
+
+/**
+ * Wait for a job to finish
+ * @param id job id
+ * @returns the result of the job
+ */
+declare async function waitJob(id: string): Promise<any>;
+
+
+/**
+ * ask user resource on a UserResourceComponent
+ */
+declare async function askNewResource(id: string): void;
+
 `
 		: ''
 }
@@ -433,3 +447,5 @@ export function getImageDataURL(imageKind: string | undefined, image: string | u
 			return image
 	}
 }
+
+export const ctxRegex = /^ctx\.(workspace|groups|username|email|author)$/

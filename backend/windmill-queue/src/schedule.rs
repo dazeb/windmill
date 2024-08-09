@@ -154,14 +154,18 @@ pub async fn push_scheduled_job<'c, R: rsmq_async::RsmqConnection + Send + 'c>(
                     hash: hash,
                     retry: parsed_retry,
                     args: static_args,
-                    custom_concurrency_key,
-                    concurrent_limit: concurrent_limit,
-                    concurrency_time_window_s: concurrency_time_window_s,
+                    custom_concurrency_key: None,
+                    concurrent_limit: None,
+                    concurrency_time_window_s: None,
                     cache_ttl: cache_ttl,
                     priority: priority,
                     tag_override: schedule.tag.clone(),
                 },
-                Some("flow".to_string()),
+                if schedule.tag.as_ref().is_some_and(|x| x != "") {
+                    schedule.tag.clone()
+                } else {
+                    tag
+                },
                 timeout,
             )
         } else {
@@ -208,7 +212,7 @@ pub async fn push_scheduled_job<'c, R: rsmq_async::RsmqConnection + Send + 'c>(
         tx,
         &schedule.workspace_id,
         payload,
-        crate::PushArgs { args, extra: HashMap::new() },
+        crate::PushArgs { args: &args, extra: None },
         &schedule_to_user(&schedule.path),
         &schedule.email,
         username_to_permissioned_as(&schedule.edited_by),
@@ -228,6 +232,7 @@ pub async fn push_scheduled_job<'c, R: rsmq_async::RsmqConnection + Send + 'c>(
         authed,
     )
     .await?;
+
     Ok(tx) // TODO: Bubble up pushed UUID from here
 }
 

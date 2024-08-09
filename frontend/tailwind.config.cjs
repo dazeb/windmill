@@ -484,7 +484,6 @@ const config = {
 
 					backgroundColor: 'rgb(var(--color-surface) / <alpha-value>)',
 					color: lightTheme.textPrimary,
-
 					'--color-surface': lightThemeRgb.surface,
 					'--color-surface-secondary': lightThemeRgb.surfaceSecondary,
 					'--color-surface-hover': lightThemeRgb.surfaceHover,
@@ -856,7 +855,6 @@ const config = {
 						width: '100% !important'
 					}
 				},
-
 				// Windmill Tab classes
 
 				'.wm-tab-active': {

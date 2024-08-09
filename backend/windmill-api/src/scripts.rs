@@ -52,7 +52,7 @@ use windmill_common::{
     utils::{
         not_found_if_none, paginate, query_elems_from_hub, require_admin, Pagination, StripPath,
     },
-    worker::to_raw_value,
+    worker::{get_annotation, to_raw_value},
     HUB_BASE_URL,
 };
 use windmill_git_sync::{handle_deployment_metadata, DeployedObject};
@@ -280,6 +280,13 @@ async fn list_scripts(
         sqlb.and_where_is_not_null("favorite.path");
     }
 
+    if lq.with_deployment_msg.unwrap_or(false) {
+        sqlb.join("deployment_metadata dm")
+            .left()
+            .on("dm.script_hash = o.hash")
+            .fields(&["dm.deployment_msg"]);
+    }
+
     let sql = sqlb.sql().map_err(|e| Error::InternalErr(e.to_string()))?;
     let mut tx = user_db.begin(&authed).await?;
     let rows = sqlx::query_as::<_, ListableScript>(&sql)
@@ -345,13 +352,16 @@ async fn create_snapshot_script(
     let mut script_hash = None;
     let mut tx = None;
     let mut uploaded = false;
+
     while let Some(field) = multipart.next_field().await.unwrap() {
         let name = field.name().unwrap().to_string();
         let data = field.bytes().await.unwrap();
         if name == "script" {
-            let ns = Some(serde_json::from_slice(&data).map_err(to_anyhow)?);
+            let ns: NewScript = Some(serde_json::from_slice(&data).map_err(to_anyhow)?).unwrap();
+            let is_tar = ns.codebase.as_ref().is_some_and(|x| x.ends_with(".tar"));
+
             let (new_hash, ntx) = create_script_internal(
-                ns.unwrap(),
+                ns,
                 w_id.clone(),
                 authed.clone(),
                 db.clone(),
@@ -360,7 +370,8 @@ async fn create_snapshot_script(
                 webhook.clone(),
             )
             .await?;
-            script_hash = Some(new_hash.to_string());
+            let nh = new_hash.to_string();
+            script_hash = Some(if is_tar { format!("{nh}.tar") } else { nh });
             tx = Some(ntx);
         }
         if name == "file" {
@@ -560,9 +571,12 @@ async fn create_script_internal<'c>(
         .as_ref()
         .map(|v| v.perms.clone())
         .unwrap_or(json!({}));
-    let lock = if !(ns.language == ScriptLang::Python3
+    let lock = if ns.codebase.is_some() {
+        Some(String::new())
+    } else if !(ns.language == ScriptLang::Python3
         || ns.language == ScriptLang::Go
         || ns.language == ScriptLang::Bun
+        || ns.language == ScriptLang::Bunnative
         || ns.language == ScriptLang::Deno
         || ns.language == ScriptLang::Php)
     {
@@ -571,12 +585,24 @@ async fn create_script_internal<'c>(
         ns.lock
             .and_then(|e| if e.is_empty() { None } else { Some(e) })
     };
-    let needs_lock_gen = lock.is_none();
+
+    let needs_lock_gen = lock.is_none() && codebase.is_none();
     let envs = ns.envs.as_ref().map(|x| x.as_slice());
     let envs = if ns.envs.is_none() || ns.envs.as_ref().unwrap().is_empty() {
         None
     } else {
         envs
+    };
+
+    let lang = if &ns.language == &ScriptLang::Bun || &ns.language == &ScriptLang::Bunnative {
+        let anns = get_annotation(&ns.content);
+        if anns.native_mode {
+            ScriptLang::Bunnative
+        } else {
+            ScriptLang::Bun
+        }
+    } else {
+        ns.language.clone()
     };
     sqlx::query!(
         "INSERT INTO script (workspace_id, hash, path, parent_hashes, summary, description, \
@@ -597,7 +623,7 @@ async fn create_script_internal<'c>(
         ns.is_template.unwrap_or(false),
         extra_perms,
         lock,
-        ns.language.clone() as ScriptLang,
+        lang as ScriptLang,
         ns.kind.unwrap_or(ScriptKind::Script) as ScriptKind,
         ns.tag,
         ns.draft_only,
@@ -738,7 +764,7 @@ async fn create_script_internal<'c>(
                 path: ns.path,
                 dedicated_worker: ns.dedicated_worker,
             },
-            args.into(),
+            windmill_queue::PushArgs::from(&args),
             &authed.username,
             &authed.email,
             permissioned_as,
