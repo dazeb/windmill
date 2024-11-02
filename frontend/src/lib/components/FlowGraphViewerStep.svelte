@@ -66,7 +66,7 @@
 				<span class="!text-xs">
 					<HighlightCode language={stepDetail.value.language} code={stepDetail.value.content} />
 				</span>
-				<h3 class="mb-2">Lockfile</h3>
+				<h3 class="mt-4 mb-2">Lockfile</h3>
 				<div>
 					{#if stepDetail.value.lock}
 						<pre class="bg-surface-secondary text-sm p-2 h-full overflow-auto w-full"
@@ -103,12 +103,17 @@
 	{:else if typeof stepDetail != 'string' && stepDetail.value}
 		<div class="">
 			<div class="sticky top-0 bg-surface w-full flex items-center py-2">
-				{#if stepDetail.id}
+				{#if stepDetail.id && stepDetail.id != 'failure' && stepDetail.id != 'preprocessor'}
 					<Badge color="indigo">
 						{stepDetail.id}
 					</Badge>
 				{/if}
-				<span class="ml-2 font-medium text-lg">
+				<span
+					class={twMerge(
+						'font-medium text-lg',
+						stepDetail.id !== 'failure' && stepDetail.id !== 'preprocessor' ? 'ml-2' : ''
+					)}
+				>
 					{#if stepDetail.summary}
 						{stepDetail.summary}
 					{:else if stepDetail.value.type == 'identity'}
@@ -122,8 +127,16 @@
 						Run one branch
 					{:else if stepDetail.value.type == 'flow'}
 						Inner flow
-					{:else}
-						Anonymous step
+					{:else if stepDetail.value.type == 'whileloopflow'}
+						While loop
+					{:else if stepDetail.id === 'failure'}
+						Error handler
+					{:else if stepDetail.id === 'preprocessor'}
+						Preprocessor
+					{:else if stepDetail.value.type == 'rawscript'}
+						Inline {stepDetail.value.language} script
+					{:else if stepDetail.value.type == 'script'}
+						Workspace script
 					{/if}
 				</span>
 			</div>
@@ -145,10 +158,12 @@
 				An identity step returns its inputs as outputs
 			</p>
 		{:else if stepDetail.value.type == 'rawscript'}
-			<div class="text-xs">
-				<h3 class="mb-2 font-semibold mt-2">Step Inputs</h3>
-				<InputTransformsViewer inputTransforms={stepDetail?.value?.input_transforms ?? {}} />
-			</div>
+			{#if stepDetail.id !== 'preprocessor'}
+				<div class="text-xs">
+					<h3 class="mb-2 font-semibold mt-2">Step Inputs</h3>
+					<InputTransformsViewer inputTransforms={stepDetail?.value?.input_transforms ?? {}} />
+				</div>
+			{/if}
 
 			<div>
 				<div class="mb-2 mt-4 flex justify-between items-center">
@@ -171,17 +186,19 @@
 							>{stepDetail.value.lock}</pre
 						>
 					{:else}
-						<p class="bg-surface-secondary text-sm p-2">
+						<p class="bg-surface-secondary text-sm p-2 rounded">
 							There is no lockfile for this inline script
 						</p>
 					{/if}
 				</div>
 			</div>
 		{:else if stepDetail.value.type == 'script'}
-			<div class="text-2xs">
-				<h3 class="mb-2 font-semibold mt-2">Step Inputs</h3>
-				<InputTransformsViewer inputTransforms={stepDetail?.value?.input_transforms ?? {}} />
-			</div>
+			{#if stepDetail.id !== 'preprocessor'}
+				<div class="text-2xs">
+					<h3 class="mb-2 font-semibold mt-2">Step Inputs</h3>
+					<InputTransformsViewer inputTransforms={stepDetail?.value?.input_transforms ?? {}} />
+				</div>
+			{/if}
 			{#if stepDetail.value.path.startsWith('hub/')}
 				<div class="flex flex-col grow">
 					<div class="mb-2 flex justify-between items-center">
@@ -191,7 +208,7 @@
 						</Button>
 					</div>
 					<iframe
-						class="w-full grow text-sm"
+						class="w-full grow text-sm h-full"
 						title="embedded script from hub"
 						frameborder="0"
 						src="{$hubBaseUrlStore}/embed/script/{stepDetail.value?.path?.substring(4)}"
@@ -208,6 +225,26 @@
 				{:else}
 					<span class="text-xs">
 						<Highlight language={typescript} code={cleanExpr(stepDetail.value.iterator.expr)} />
+					</span>
+				{/if}
+			</div>
+		{:else if stepDetail.value.type == 'whileloopflow'}
+			<div>
+				{#if stepDetail.stop_after_if}
+					<p class="font-medium text-secondary pb-2 pt-4">Stop after if expr:: </p>
+					<span class="text-xs">
+						<Highlight language={typescript} code={cleanExpr(stepDetail.stop_after_if?.expr)} />
+					</span>
+				{/if}
+			</div>
+			<div>
+				{#if stepDetail.stop_after_all_iters_if}
+					<p class="font-medium text-secondary pb-2 pt-4">Stop after all iters if expr:: </p>
+					<span class="text-xs">
+						<Highlight
+							language={typescript}
+							code={cleanExpr(stepDetail.stop_after_all_iters_if?.expr)}
+						/>
 					</span>
 				{/if}
 			</div>

@@ -5,18 +5,16 @@ import {
   colors,
   Command,
   Confirm,
-  JobService,
   log,
-  NewScript,
   readAll,
-  Script,
-  ScriptService,
   SEP,
   Table,
   writeAllSync,
   yamlStringify,
 } from "./deps.ts";
 import { deepEqual } from "./utils.ts";
+import * as wmill from "./gen/services.gen.ts";
+
 import {
   defaultScriptMetadata,
   scriptBootstrapCode,
@@ -46,6 +44,11 @@ import {
   readConfigFile,
 } from "./conf.ts";
 import { SyncCodebase, listSyncCodebases } from "./codebase.ts";
+import fs from "node:fs";
+import { type Tarball } from "npm:@ayonli/jsext/archive";
+
+import { execSync } from "node:child_process";
+import { NewScript, Script } from "./gen/types.gen.ts";
 
 export interface ScriptFile {
   parent_hash?: string;
@@ -91,6 +94,38 @@ async function push(opts: PushOptions, filePath: string) {
     codebases
   );
   log.info(colors.bold.underline.green(`Script ${filePath} pushed`));
+}
+
+export async function findResourceFile(path: string) {
+  const splitPath = path.split(".");
+
+  const contentBasePathJSON = splitPath[0] + "." + splitPath[1] + ".json";
+  const contentBasePathYAML = splitPath[0] + "." + splitPath[1] + ".yaml";
+
+  const validCandidates = (
+    await Promise.all(
+      [contentBasePathJSON, contentBasePathYAML].map((x) => {
+        return Deno.stat(x)
+          .catch(() => undefined)
+          .then((x) => x?.isFile)
+          .then((e) => {
+            return { path: x, file: e };
+          });
+      })
+    )
+  )
+    .filter((x) => x.file)
+    .map((x) => x.path);
+  if (validCandidates.length > 1) {
+    throw new Error(
+      "Found two resource files for the same resource" +
+        validCandidates.join(", ")
+    );
+  }
+  if (validCandidates.length < 1) {
+    throw new Error(`No resource matching file resource: ${path}.`);
+  }
+  return validCandidates[0];
 }
 
 export async function handleScriptMetadata(
@@ -150,18 +185,57 @@ export async function handleFile(
     const codebase =
       language == "bun" ? findCodebase(path, codebases) : undefined;
 
-    let bundleContent: string | undefined = undefined;
+    let bundleContent: string | Tarball | undefined = undefined;
 
     if (codebase) {
-      const esbuild = await import("npm:esbuild");
-      log.info(`Starting building the bundle for ${path}`);
-      const out = await esbuild.build({
-        entryPoints: [path],
-        format: "esm",
-        bundle: true,
-        write: false,
-      });
-      bundleContent = out.outputFiles[0].text;
+      if (codebase.customBundler) {
+        log.info(`Using custom bundler ${codebase.customBundler} for ${path}`);
+        bundleContent = execSync(
+          codebase.customBundler + " " + path
+        ).toString();
+        log.info("Custom bundler executed");
+      } else {
+        const esbuild = await import("npm:esbuild");
+
+        log.info(`Starting building the bundle for ${path}`);
+        const out = await esbuild.build({
+          entryPoints: [path],
+          format: "cjs",
+          bundle: true,
+          write: false,
+          external: codebase.external,
+          inject: codebase.inject,
+          define: codebase.define,
+          platform: "node",
+          packages: "bundle",
+          target: "node20.15.1",
+        });
+        bundleContent = out.outputFiles[0].text;
+        log.info(
+          "Bundle size: " + (bundleContent.length / 1024).toFixed(0) + "kB"
+        );
+      }
+      if (Array.isArray(codebase.assets) && codebase.assets.length > 0) {
+        const archiveNpm = await import("npm:@ayonli/jsext/archive");
+
+        log.info(
+          `Using the following asset configuration: ${JSON.stringify(
+            codebase.assets
+          )}`
+        );
+        const tarball = new archiveNpm.Tarball();
+        tarball.append(
+          new File([bundleContent], "main.js", { type: "text/plain" })
+        );
+        for (const asset of codebase.assets) {
+          const data = fs.readFileSync(asset.from);
+          const blob = new Blob([data], { type: "text/plain" });
+          const file = new File([blob], asset.to);
+          tarball.append(file);
+        }
+        log.info("Tarball size: " + (tarball.size / 1024).toFixed(0) + "kB");
+        bundleContent = tarball;
+      }
       log.info(`Finished building the bundle for ${path}`);
     }
     const typed = (
@@ -184,9 +258,9 @@ export async function handleFile(
 
     let remote = undefined;
     try {
-      remote = await ScriptService.getScriptByPath({
+      remote = await wmill.getScriptByPath({
         workspace: workspaceId,
-        path: remotePath.replaceAll(SEP, "/"),
+        path: remotePath,
       });
       log.debug(`Script ${remotePath} exists on remote`);
     } catch {
@@ -229,6 +303,7 @@ export async function handleFile(
       restart_unless_cancelled: typed?.restart_unless_cancelled,
       visible_to_runner_only: typed?.visible_to_runner_only,
       no_main_func: typed?.no_main_func,
+      has_preprocessor: typed?.has_preprocessor,
       priority: typed?.priority,
       concurrency_key: typed?.concurrency_key,
       //@ts-ignore
@@ -262,10 +337,13 @@ export async function handleFile(
             Boolean(typed.visible_to_runner_only) ==
               Boolean(remote.visible_to_runner_only) &&
             Boolean(typed.no_main_func) == Boolean(remote.no_main_func) &&
+            Boolean(typed.has_preprocessor) ==
+              Boolean(remote.has_preprocessor) &&
             typed.priority == Boolean(remote.priority) &&
             typed.timeout == remote.timeout &&
             //@ts-ignore
-            typed.concurrency_key == remote["concurrency_key"])
+            typed.concurrency_key == remote["concurrency_key"] &&
+            typed.codebase == remote.codebase)
         ) {
           log.info(colors.green(`Script ${remotePath} is up to date`));
           return true;
@@ -296,22 +374,58 @@ export async function handleFile(
   return false;
 }
 
+async function streamToBlob(stream: ReadableStream<Uint8Array>): Promise<Blob> {
+  // Create a reader from the stream
+  const reader = stream.getReader();
+  const chunks = [];
+
+  // Read the data from the stream
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      // If stream is finished, break the loop
+      break;
+    }
+
+    // Push the chunk to the array
+    chunks.push(value);
+  }
+
+  // Create a Blob from the chunks
+  const blob = new Blob(chunks);
+  return blob;
+}
+
 async function createScript(
-  bundleContent: string | undefined,
+  bundleContent: string | Tarball | undefined,
   workspaceId: string,
   body: NewScript,
   workspace: Workspace
 ) {
   if (!bundleContent) {
-    // no parent hash
-    await ScriptService.createScript({
-      workspace: workspaceId,
-      requestBody: body,
-    });
+    try {
+      // no parent hash
+      await wmill.createScript({
+        workspace: workspaceId,
+        requestBody: body,
+      });
+    } catch (e) {
+      throw Error(
+        `Script creation for ${body.path} with parent ${
+          body.parent_hash
+        }  was not successful: ${e.body ?? e.message}`
+      );
+    }
   } else {
     const form = new FormData();
     form.append("script", JSON.stringify(body));
-    form.append("file", bundleContent);
+    form.append(
+      "file",
+      typeof bundleContent == "string"
+        ? bundleContent
+        : await streamToBlob(bundleContent.stream())
+    );
 
     const url =
       workspace.remote +
@@ -408,6 +522,10 @@ export function filePathExtensionFromContentType(
     return ".ps1";
   } else if (language === "php") {
     return ".php";
+  } else if (language === "rust") {
+    return ".rs";
+  } else if (language === "ansible") {
+    return ".playbook.yml";
   } else {
     throw new Error("Invalid language: " + language);
   }
@@ -429,6 +547,9 @@ export const exts = [
   ".sql",
   ".gql",
   ".ps1",
+  ".php",
+  ".rs",
+  ".playbook.yml",
 ];
 
 export function removeExtensionToPath(path: string): string {
@@ -454,7 +575,7 @@ async function list(
   const perPage = 10;
   const total: Script[] = [];
   while (true) {
-    const res = await ScriptService.listScripts({
+    const res = await wmill.listScripts({
       workspace: workspace.workspaceId,
       page,
       perPage,
@@ -507,7 +628,7 @@ async function run(
   await requireLogin(opts);
 
   const input = opts.data ? await resolve(opts.data) : {};
-  const id = await JobService.runScriptByPath({
+  const id = await wmill.runScriptByPath({
     workspace: workspace.workspaceId,
     path,
     requestBody: input,
@@ -521,7 +642,7 @@ async function run(
     try {
       const result =
         (
-          await JobService.getCompletedJob({
+          await wmill.getCompletedJob({
             workspace: workspace.workspaceId,
             id,
           })
@@ -542,7 +663,7 @@ async function run(
 
 export async function track_job(workspace: string, id: string) {
   try {
-    const result = await JobService.getCompletedJob({ workspace, id });
+    const result = await wmill.getCompletedJob({ workspace, id });
 
     log.info(result.logs);
     log.info("\n");
@@ -565,7 +686,7 @@ export async function track_job(workspace: string, id: string) {
       new_logs?: string | undefined;
     };
     try {
-      updates = await JobService.getJobUpdates({
+      updates = await wmill.getJobUpdates({
         workspace,
         id,
         logOffset,
@@ -603,7 +724,7 @@ export async function track_job(workspace: string, id: string) {
   await new Promise((resolve, _) => setTimeout(() => resolve(undefined), 1000));
 
   try {
-    const final_job = await JobService.getCompletedJob({ workspace, id });
+    const final_job = await wmill.getCompletedJob({ workspace, id });
     if ((final_job.logs?.length ?? -1) > logOffset) {
       log.info(final_job.logs!.substring(logOffset));
     }
@@ -622,7 +743,7 @@ export async function track_job(workspace: string, id: string) {
 async function show(opts: GlobalOptions, path: string) {
   const workspace = await resolveWorkspace(opts);
   await requireLogin(opts);
-  const s = await ScriptService.getScriptByPath({
+  const s = await wmill.getScriptByPath({
     workspace: workspace.workspaceId,
     path,
   });

@@ -15,6 +15,7 @@
 	export let isValid: boolean = true
 	export let defaultValues: Record<string, any> = {}
 	export let dynamicEnums: Record<string, any> = {}
+	export let disabled: boolean = false
 
 	let inputCheck: { [id: string]: boolean } = {}
 	let errors: { [id: string]: string } = {}
@@ -71,7 +72,10 @@
 	}
 </script>
 
-<div class={twMerge('w-full flex flex-col px-0.5 pb-2', largeGap ? 'gap-8' : 'gap-2')}>
+<div
+	class={twMerge('w-full flex flex-col px-0.5 pb-2', largeGap ? 'gap-8' : 'gap-2')}
+	on:pointerdown
+>
 	{#each keys as argName (argName)}
 		{#if typeof args == 'object' && schema?.properties[argName] && args}
 			<LightweightArgInput
@@ -99,6 +103,7 @@
 				on:inputClicked
 				{displayType}
 				{css}
+				disabled={disabled || schema.properties[argName].disabled}
 			/>
 		{/if}
 	{/each}

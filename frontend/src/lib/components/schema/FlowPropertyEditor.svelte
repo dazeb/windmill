@@ -20,16 +20,17 @@
 	import Popup from '../common/popup/Popup.svelte'
 	import { deepEqual } from 'fast-equals'
 
-	export let format: string = ''
+	export let format: string | undefined = undefined
 	export let contentEncoding: 'base64' | 'binary' | undefined = undefined
 	export let type: string | undefined = undefined
 	export let oneOf: SchemaProperty[] | undefined = undefined
 	export let required = false
 	export let pattern: undefined | string = undefined
-	export let password = false
+	export let password: undefined | boolean = undefined
 	export let variableEditor: VariableEditor | undefined = undefined
 	export let itemPicker: ItemPicker | undefined = undefined
-	export let nullable: boolean = false
+	export let nullable: boolean | undefined = undefined
+	export let disabled: boolean | undefined = undefined
 	export let defaultValue: any = undefined
 	export let propsNames: any = []
 	export let showExpr: string | undefined = undefined
@@ -43,9 +44,9 @@
 				multiselect?: string[]
 		  }
 		| undefined = undefined
-	export let properties: Record<string, any> = {}
-	export let order: string[] = []
-	export let requiredProperty: string[] = []
+	export let properties: Record<string, any> | undefined = undefined
+	export let order: string[] | undefined = undefined
+	export let requiredProperty: string[] | undefined = undefined
 	export let displayWebhookWarning: boolean = true
 	export let lightweightMode: boolean = false
 
@@ -74,9 +75,11 @@
 			) {
 				// update schema if not exists or order changed
 				schema.oneOf = getOneOfWithoutLabel(oneOf)
+				schema = schema
 			}
 		} else if (!oneOf) {
 			schema.oneOf = undefined
+			schema = schema
 		}
 	}
 	$: oneOfUpdate(oneOf)
@@ -85,6 +88,7 @@
 		if (order && !deepEqual(order, schema.order)) {
 			// update from external reordering
 			schema.order = order
+			schema = schema
 		}
 	}
 	$: orderUpdate(order)
@@ -106,8 +110,6 @@
 		oneOf: oneOf ? getOneOfWithoutLabel(oneOf) : undefined
 	}
 
-	console.log('initial schema', schema)
-
 	function schemaUpdate(changedSchema: typeof schema) {
 		if (
 			!deepEqual(changedSchema, {
@@ -117,14 +119,14 @@
 				oneOf: oneOf ? getOneOfWithoutLabel(oneOf) : undefined
 			})
 		) {
-			properties = changedSchema.properties
-			order = changedSchema.order
-			requiredProperty = changedSchema.required
+			properties = structuredClone(changedSchema.properties)
+			order = structuredClone(changedSchema.order)
+			requiredProperty = structuredClone(changedSchema.required)
 			oneOf = changedSchema.oneOf?.map((v) => {
 				return {
 					...v,
 					properties: {
-						...v.properties,
+						...(v.properties ?? {}),
 						label: {
 							type: 'string',
 							enum: [v.title ?? '']
@@ -132,8 +134,7 @@
 					}
 				}
 			})
-
-			dispatch('schemaChange')
+			dispatch('schemaChange', { properties, order, requiredProperty, oneOf })
 		}
 	}
 
@@ -174,6 +175,9 @@
 			variantName = ''
 		}
 	}
+
+	let initialObjectSelected =
+		Object.keys(schema?.properties ?? {}).length == 0 ? 'resource' : 'custom-object'
 </script>
 
 <div class="flex flex-col gap-2">
@@ -297,7 +301,7 @@
 		{/if}
 	{:else if type === 'object' && format !== 'resource-s3_object'}
 		<Tabs
-			selected="resource"
+			selected={initialObjectSelected}
 			on:selected={(e) => {
 				if (e.detail === 'custom-object') {
 					format = ''
@@ -333,9 +337,11 @@
 					{contentEncoding}
 					{format}
 					{extra}
+					{disabled}
 				/>
 			{:else}
 				<ArgInput
+					noDefaultOnSelectFirst
 					{itemPicker}
 					resourceTypes={getResourceTypesFromFormat(format)}
 					bind:value={defaultValue}
@@ -347,6 +353,7 @@
 					{contentEncoding}
 					{format}
 					{extra}
+					{disabled}
 					{nullable}
 					{variableEditor}
 					compact
@@ -379,10 +386,33 @@
 				}}
 				lightMode
 				size="xs"
-				bind:checked={nullable}
+				checked={nullable}
+				on:change={(event) => {
+					if (event?.detail) {
+						nullable = true
+					} else {
+						nullable = undefined
+					}
+				}}
 				disabled={required}
 			/>
 		{/if}
+		<Toggle
+			options={{
+				right: 'Disabled',
+				rightTooltip: 'Do not let user modify this field'
+			}}
+			lightMode
+			size="xs"
+			checked={disabled}
+			on:change={(event) => {
+				if (event?.detail) {
+					disabled = true
+				} else {
+					disabled = undefined
+				}
+			}}
+		/>
 	</div>
 
 	{#if displayWebhookWarning && !(type === 'object' && oneOf && oneOf.length >= 2)}

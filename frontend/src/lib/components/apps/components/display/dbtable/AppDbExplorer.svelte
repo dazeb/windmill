@@ -25,7 +25,8 @@
 	import { Plus } from 'lucide-svelte'
 	import { Drawer, DrawerContent } from '$lib/components/common'
 	import InsertRow from './InsertRow.svelte'
-	import Portal from 'svelte-portal'
+	import Portal from '$lib/components/Portal.svelte'
+
 	import { sendUserToast } from '$lib/toast'
 	import type { AppInput, StaticInput } from '$lib/components/apps/inputType'
 	import DbExplorerCount from './DbExplorerCount.svelte'
@@ -287,6 +288,11 @@
 			}
 
 			if (!render) {
+				return
+			}
+
+			if (!runnableComponent) {
+				params.successCallback([], 0)
 				return
 			}
 
@@ -689,7 +695,7 @@
 		{/if}
 	</div>
 </RunnableWrapper>
-<Portal>
+<Portal name="db-explorer">
 	<Drawer bind:this={insertDrawer} size="800px">
 		<DrawerContent title="Insert row" on:close={insertDrawer.closeDrawer}>
 			<svelte:fragment slot="actions">

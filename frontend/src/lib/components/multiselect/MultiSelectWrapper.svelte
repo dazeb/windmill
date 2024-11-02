@@ -1,6 +1,7 @@
 <script lang="ts">
 	// @ts-ignore
-	import Portal from 'svelte-portal'
+	import Portal from '$lib/components/Portal.svelte'
+
 	import { createFloatingActions } from 'svelte-floating-ui'
 	import { tick } from 'svelte'
 	import { offset, flip, shift } from 'svelte-floating-ui/dom'
@@ -79,7 +80,7 @@
 				</div>
 			</MultiSelect>
 		</div>
-		<Portal>
+		<Portal name="multi-select">
 			<div use:floatingContent class="z5000" hidden={!open}>
 				<!-- svelte-ignore a11y-click-events-have-key-events -->
 				<!-- svelte-ignore a11y-no-static-element-interactions -->

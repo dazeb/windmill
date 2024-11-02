@@ -6,7 +6,8 @@
 	import { computeKey } from './utils'
 	import WarningMessage from './WarningMessage.svelte'
 	import { NEVER_TESTED_THIS_FAR } from '../flows/models'
-	import Portal from 'svelte-portal'
+	import Portal from '$lib/components/Portal.svelte'
+
 	import { Download, PanelRightOpen } from 'lucide-svelte'
 	import S3FilePicker from '../S3FilePicker.svelte'
 	import { workspaceStore } from '$lib/stores'
@@ -62,7 +63,7 @@
 	$: fullyCollapsed = keys.length > 1 && collapsed
 </script>
 
-<Portal>
+<Portal name="object-viewer">
 	<S3FilePicker bind:this={s3FileViewer} readOnlyMode={true} />
 </Portal>
 

@@ -7,9 +7,12 @@
  */
 
 use crate::db::ApiAuthed;
+#[cfg(feature = "enterprise")]
+use crate::ee::ExternalJwks;
 #[cfg(feature = "embedding")]
 use crate::embeddings::load_embeddings_db;
 use crate::oauth2_ee::AllClients;
+use crate::smtp_server_ee::SmtpServer;
 use crate::tracing_init::MyOnFailure;
 use crate::{
     oauth2_ee::SlackVerifier,
@@ -36,9 +39,8 @@ use tower_http::{
     trace::TraceLayer,
 };
 use windmill_common::db::UserDB;
-use windmill_common::utils::rd_string;
-use windmill_common::worker::ALL_TAGS;
-use windmill_common::BASE_URL;
+use windmill_common::worker::{ALL_TAGS, CLOUD_HOSTED};
+use windmill_common::{BASE_URL, INSTANCE_NAME};
 
 use crate::scim_ee::has_scim_token;
 use windmill_common::error::AppError;
@@ -57,6 +59,8 @@ mod flows;
 mod folders;
 mod granular_acls;
 mod groups;
+mod http_triggers;
+mod indexer_ee;
 mod inputs;
 mod integration;
 #[cfg(feature = "parquet")]
@@ -72,16 +76,22 @@ mod saml_ee;
 mod schedule;
 mod scim_ee;
 mod scripts;
+mod service_logs;
 mod settings;
+pub mod smtp_server_ee;
 mod static_assets;
 mod stripe_ee;
 mod tracing_init;
+mod triggers;
 mod users;
+mod users_ee;
 mod utils;
 mod variables;
 mod webhook_util;
+mod websocket_triggers;
 mod workers;
 mod workspaces;
+mod workspaces_ee;
 
 pub const GIT_VERSION: &str =
     git_version!(args = ["--tag", "--always"], fallback = "unknown-version");
@@ -140,13 +150,27 @@ pub async fn add_webhook_allowed_origin(
     next.run(req).await
 }
 
+#[cfg(not(feature = "tantivy"))]
+type IndexReader = ();
+
+#[cfg(not(feature = "tantivy"))]
+type IndexWriter = ();
+
+#[cfg(feature = "tantivy")]
+type IndexReader = windmill_indexer::indexer_ee::IndexReader;
+#[cfg(feature = "tantivy")]
+type IndexWriter = windmill_indexer::indexer_ee::IndexWriter;
+
 pub async fn run_server(
     db: DB,
     rsmq: Option<rsmq_async::MultiplexedRsmq>,
+    index_reader: Option<IndexReader>,
+    index_writer: Option<IndexWriter>,
     addr: SocketAddr,
     mut rx: tokio::sync::broadcast::Receiver<()>,
     port_tx: tokio::sync::oneshot::Sender<String>,
     server_mode: bool,
+    base_internal_url: String,
 ) -> anyhow::Result<()> {
     if let Some(mut rsmq) = rsmq.clone() {
         for tag in ALL_TAGS.read().await.iter() {
@@ -161,9 +185,13 @@ pub async fn run_server(
     }
     let user_db = UserDB::new(db.clone());
 
+    #[cfg(feature = "enterprise")]
+    let ext_jwks = ExternalJwks::load().await;
     let auth_cache = Arc::new(users::AuthCache::new(
         db.clone(),
         std::env::var("SUPERADMIN_SECRET").ok(),
+        #[cfg(feature = "enterprise")]
+        ext_jwks,
     ));
     let argon2 = Arc::new(Argon2::default());
 
@@ -174,9 +202,11 @@ pub async fn run_server(
 
     let middleware_stack = ServiceBuilder::new()
         .layer(Extension(db.clone()))
-        .layer(Extension(rsmq))
-        .layer(Extension(user_db))
+        .layer(Extension(rsmq.clone()))
+        .layer(Extension(user_db.clone()))
         .layer(Extension(auth_cache.clone()))
+        .layer(Extension(index_reader))
+        .layer(Extension(index_writer))
         .layer(CookieManagerLayer::new())
         .layer(Extension(WebhookShared::new(rx.resubscribe(), db.clone())))
         .layer(DefaultBodyLimit::max(
@@ -192,7 +222,18 @@ pub async fn run_server(
 
     if server_mode {
         #[cfg(feature = "embedding")]
-        load_embeddings_db(&db)
+        load_embeddings_db(&db);
+
+        let smtp_server = Arc::new(SmtpServer {
+            db: db.clone(),
+            user_db: user_db,
+            auth_cache: auth_cache.clone(),
+            rsmq: rsmq.clone(),
+            base_internal_url: base_internal_url.clone(),
+        });
+        if let Err(err) = smtp_server.start_listener_thread(addr).await {
+            tracing::error!("Error starting SMTP server: {err:#}");
+        }
     }
 
     let job_helpers_service = {
@@ -206,6 +247,11 @@ pub async fn run_server(
             Router::new()
         }
     };
+
+    if !*CLOUD_HOSTED {
+        let ws_killpill_rx = rx.resubscribe();
+        websocket_triggers::start_websockets(db.clone(), rsmq, ws_killpill_rx).await;
+    }
 
     // build our application with a route
     let app = Router::new()
@@ -246,7 +292,12 @@ pub async fn run_server(
                         )
                         .nest("/variables", variables::workspaced_service())
                         .nest("/workspaces", workspaces::workspaced_service())
-                        .nest("/oidc", oidc_ee::workspaced_service()),
+                        .nest("/oidc", oidc_ee::workspaced_service())
+                        .nest("/http_triggers", http_triggers::workspaced_service())
+                        .nest(
+                            "/websocket_triggers",
+                            websocket_triggers::workspaced_service(),
+                        ),
                 )
                 .nest("/workspaces", workspaces::global_service())
                 .nest(
@@ -255,6 +306,7 @@ pub async fn run_server(
                 )
                 .nest("/settings", settings::global_service())
                 .nest("/workers", workers::global_service())
+                .nest("/service_logs", service_logs::global_service())
                 .nest("/configs", configs::global_service())
                 .nest("/scripts", scripts::global_service())
                 .nest("/integrations", integration::global_service())
@@ -266,6 +318,10 @@ pub async fn run_server(
                 .route_layer(from_extractor::<ApiAuthed>())
                 .route_layer(from_extractor::<users::Tokened>())
                 .nest("/jobs", jobs::global_root_service())
+                .nest(
+                    "/srch/w/:workspace_id/index",
+                    indexer_ee::workspaced_service(),
+                )
                 .nest("/oidc", oidc_ee::global_service())
                 .nest(
                     "/saml",
@@ -286,7 +342,7 @@ pub async fn run_server(
                 )
                 .nest(
                     "/w/:workspace_id/jobs_u",
-                    jobs::global_service().layer(cors.clone()),
+                    jobs::workspace_unauthed_service().layer(cors.clone()),
                 )
                 .nest(
                     "/w/:workspace_id/resources_u",
@@ -294,7 +350,7 @@ pub async fn run_server(
                 )
                 .nest(
                     "/w/:workspace_id/capture_u",
-                    capture::global_service().layer(cors),
+                    capture::global_service().layer(cors.clone()),
                 )
                 .nest(
                     "/auth",
@@ -303,6 +359,10 @@ pub async fn run_server(
                 .nest(
                     "/oauth",
                     oauth2_ee::global_service().layer(Extension(Arc::clone(&sp_extension))),
+                )
+                .nest(
+                    "/r",
+                    http_triggers::routes_global_service().layer(from_extractor::<OptAuthed>()),
                 )
                 .route("/version", get(git_v))
                 .route("/uptodate", get(is_up_to_date))
@@ -325,8 +385,6 @@ pub async fn run_server(
         )
     };
 
-    let instance_name = rd_string(5);
-
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let port = listener.local_addr().map(|x| x.port()).unwrap_or(8000);
     let ip = listener
@@ -337,7 +395,7 @@ pub async fn run_server(
     let server = axum::serve(listener, app.into_make_service());
 
     tracing::info!(
-        instance = %instance_name,
+        instance = %*INSTANCE_NAME,
         "server started on port={} and addr={}",
         port,
         ip
@@ -349,7 +407,7 @@ pub async fn run_server(
 
     let server = server.with_graceful_shutdown(async move {
         rx.recv().await.ok();
-        println!("Graceful shutdown of server");
+        tracing::info!("Graceful shutdown of server");
     });
 
     server.await?;
@@ -400,9 +458,13 @@ async fn ee_license() -> &'static str {
 
 #[cfg(feature = "enterprise")]
 async fn ee_license() -> String {
-    use windmill_common::ee::LICENSE_KEY_ID;
+    use windmill_common::ee::{LICENSE_KEY_ID, LICENSE_KEY_VALID};
 
-    LICENSE_KEY_ID.read().await.clone()
+    if *LICENSE_KEY_VALID.read().await {
+        LICENSE_KEY_ID.read().await.clone()
+    } else {
+        "".to_string()
+    }
 }
 
 async fn openapi() -> &'static str {

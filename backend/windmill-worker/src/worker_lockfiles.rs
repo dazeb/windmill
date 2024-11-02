@@ -12,7 +12,7 @@ use windmill_common::flows::{FlowModule, FlowModuleValue};
 use windmill_common::get_latest_deployed_hash_for_path;
 use windmill_common::jobs::JobPayload;
 use windmill_common::scripts::ScriptHash;
-use windmill_common::worker::{to_raw_value, to_raw_value_owned};
+use windmill_common::worker::{to_raw_value, to_raw_value_owned, write_file};
 use windmill_common::{
     error::{self, to_anyhow},
     flows::FlowValue,
@@ -25,10 +25,11 @@ use windmill_parser_py_imports::parse_relative_imports;
 use windmill_parser_ts::parse_expr_for_imports;
 use windmill_queue::{append_logs, CanceledBy, PushIsolationLevel};
 
-use crate::python_executor::{create_dependencies_dir, handle_python_reqs, pip_compile};
+use crate::common::OccupancyMetrics;
+use crate::python_executor::{create_dependencies_dir, handle_python_reqs, uv_pip_compile};
+use crate::rust_executor::{build_rust_crate, compute_rust_hash, generate_cargo_lockfile};
 use crate::{
-    bun_executor::gen_lockfile,
-    common::write_file,
+    bun_executor::gen_bun_lockfile,
     deno_executor::generate_deno_lock,
     go_executor::install_go_dependencies,
     php_executor::{composer_install, parse_php_imports},
@@ -82,7 +83,7 @@ async fn add_relative_imports_to_dependency_map<'c>(
     for import in relative_imports {
         sqlx::query!(
             "INSERT INTO dependency_map (workspace_id, importer_path, importer_kind, imported_path, importer_node_id)
-                 VALUES ($1, $2, $4::text::IMPORTER_KIND, $3, $5)",
+                 VALUES ($1, $2, $4::text::IMPORTER_KIND, $3, $5) ON CONFLICT DO NOTHING",
             w_id,
             script_path,
             import,
@@ -187,14 +188,16 @@ fn parse_bun_relative_imports(raw_code: &str, script_path: &str) -> error::Resul
     Ok(relative_imports)
 }
 
-fn extract_relative_imports(
+pub fn extract_relative_imports(
     raw_code: &str,
     script_path: &str,
     language: &Option<ScriptLang>,
 ) -> Option<Vec<String>> {
     match language {
         Some(ScriptLang::Python3) => parse_relative_imports(&raw_code, script_path).ok(),
-        Some(ScriptLang::Bun) => parse_bun_relative_imports(&raw_code, script_path).ok(),
+        Some(ScriptLang::Bun) | Some(ScriptLang::Bunnative) => {
+            parse_bun_relative_imports(&raw_code, script_path).ok()
+        }
         _ => None,
     }
 }
@@ -210,6 +213,7 @@ pub async fn handle_dependency_job<R: rsmq_async::RsmqConnection + Send + Sync +
     base_internal_url: &str,
     token: &str,
     rsmq: Option<R>,
+    occupancy_metrics: &mut OccupancyMetrics,
 ) -> error::Result<Box<RawValue>> {
     let raw_code = match job.raw_code {
         Some(ref code) => code.to_owned(),
@@ -232,6 +236,24 @@ pub async fn handle_dependency_job<R: rsmq_async::RsmqConnection + Send + Sync +
                 .is_some_and(|y| y.to_string().as_str() == "true")
         })
         .unwrap_or(false);
+    let npm_mode = if job
+        .language
+        .as_ref()
+        .map(|v| v == &ScriptLang::Bun)
+        .unwrap_or(false)
+    {
+        Some(
+            job.args
+                .as_ref()
+                .map(|x| {
+                    x.get("npm_mode")
+                        .is_some_and(|y| y.to_string().as_str() == "true")
+                })
+                .unwrap_or(false),
+        )
+    } else {
+        None
+    };
 
     let content = capture_dependency_job(
         &job.id,
@@ -252,6 +274,8 @@ pub async fn handle_dependency_job<R: rsmq_async::RsmqConnection + Send + Sync +
         token,
         script_path,
         raw_deps,
+        npm_mode,
+        occupancy_metrics,
     )
     .await;
 
@@ -308,6 +332,16 @@ pub async fn handle_dependency_job<R: rsmq_async::RsmqConnection + Send + Sync +
                     relative_imports,
                 )
                 .await?;
+                let already_visited = job
+                    .args
+                    .as_ref()
+                    .map(|x| {
+                        x.get("already_visited")
+                            .map(|v| serde_json::from_str::<Vec<String>>(v.get()).ok())
+                            .flatten()
+                    })
+                    .flatten()
+                    .unwrap_or_default();
                 if let Err(e) = trigger_dependents_to_recompute_dependencies(
                     w_id,
                     script_path,
@@ -318,6 +352,7 @@ pub async fn handle_dependency_job<R: rsmq_async::RsmqConnection + Send + Sync +
                     &job.permissioned_as,
                     db,
                     rsmq,
+                    already_visited,
                 )
                 .await
                 {
@@ -364,6 +399,7 @@ async fn trigger_dependents_to_recompute_dependencies<
     permissioned_as: &str,
     db: &sqlx::Pool<sqlx::Postgres>,
     rsmq: Option<R>,
+    mut already_visited: Vec<String>,
 ) -> error::Result<()> {
     let script_importers = sqlx::query!(
         "SELECT importer_path, importer_kind::text, array_agg(importer_node_id) as importer_node_ids FROM dependency_map
@@ -375,7 +411,12 @@ async fn trigger_dependents_to_recompute_dependencies<
     )
     .fetch_all(db)
     .await?;
+
+    already_visited.push(script_path.to_string());
     for s in script_importers.iter() {
+        if already_visited.contains(&s.importer_path) {
+            continue;
+        }
         let tx: PushIsolationLevel<'_, R> =
             PushIsolationLevel::IsolatedRoot(db.clone(), rsmq.clone());
         let mut args: HashMap<String, Box<RawValue>> = HashMap::new();
@@ -386,6 +427,10 @@ async fn trigger_dependents_to_recompute_dependencies<
             args.insert("common_dependency_path".to_string(), to_raw_value(&p_path));
         }
 
+        args.insert(
+            "already_visited".to_string(),
+            to_raw_value(&already_visited),
+        );
         let kind = s.importer_kind.clone().unwrap_or_default();
         let job_payload = if kind == "script" {
             let r = get_latest_deployed_hash_for_path(db, w_id, s.importer_path.as_str()).await;
@@ -409,7 +454,34 @@ async fn trigger_dependents_to_recompute_dependencies<
                 "nodes_to_relock".to_string(),
                 to_raw_value(&s.importer_node_ids),
             );
-            JobPayload::FlowDependencies { path: s.importer_path.clone(), dedicated_worker: None }
+            let r = sqlx::query_scalar!(
+                "SELECT versions[array_upper(versions, 1)] FROM flow WHERE path = $1 AND workspace_id = $2",
+                s.importer_path,
+                w_id,
+            ).fetch_one(db)
+            .await
+            .map_err(to_anyhow);
+            match r {
+                Ok(Some(version)) => JobPayload::FlowDependencies {
+                    path: s.importer_path.clone(),
+                    dedicated_worker: None,
+                    version: version,
+                },
+                Ok(None) => {
+                    tracing::error!(
+                        "no flow version found for path {path}",
+                        path = s.importer_path
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "error getting latest deployed flow version for path {path}: {err}",
+                        path = s.importer_path,
+                    );
+                    continue;
+                }
+            }
         } else {
             tracing::error!(
                 "unexpected importer kind: {kind} for path {path}",
@@ -424,7 +496,7 @@ async fn trigger_dependents_to_recompute_dependencies<
             tx,
             &w_id,
             job_payload,
-            windmill_queue::PushArgs { args, extra: HashMap::new() },
+            windmill_queue::PushArgs { args: &args, extra: None },
             &created_by,
             email,
             permissioned_as.to_string(),
@@ -464,12 +536,40 @@ pub async fn handle_flow_dependency_job<R: rsmq_async::RsmqConnection + Send + S
     base_internal_url: &str,
     token: &str,
     rsmq: Option<R>,
+    occupancy_metrics: &mut OccupancyMetrics,
 ) -> error::Result<Box<serde_json::value::RawValue>> {
     let job_path = job.script_path.clone().ok_or_else(|| {
         error::Error::InternalErr(
             "Cannot resolve flow dependencies for flow without path".to_string(),
         )
     })?;
+
+    let skip_flow_update = job
+        .args
+        .as_ref()
+        .map(|x| {
+            x.get("skip_flow_update")
+                .map(|v| serde_json::from_str::<bool>(v.get()).ok())
+                .flatten()
+        })
+        .flatten()
+        .unwrap_or(false);
+
+    let version = if skip_flow_update {
+        None
+    } else {
+        Some(
+            job.script_hash
+                .clone()
+                .ok_or_else(|| {
+                    Error::InternalErr(
+                        "Flow Dependency requires script hash (flow version)".to_owned(),
+                    )
+                })?
+                .0,
+        )
+    };
+
     let raw_flow = job.raw_flow.clone().map(|v| Ok(v)).unwrap_or_else(|| {
         Err(Error::InternalErr(
             "Flow Dependency requires raw flow".to_owned(),
@@ -509,6 +609,7 @@ pub async fn handle_flow_dependency_job<R: rsmq_async::RsmqConnection + Send + S
         base_internal_url,
         token,
         &nodes_to_relock,
+        occupancy_metrics,
     )
     .await?;
     let new_flow_value = serde_json::to_value(flow).map_err(to_anyhow)?;
@@ -527,18 +628,12 @@ pub async fn handle_flow_dependency_job<R: rsmq_async::RsmqConnection + Send + S
             "status": "Flow lock generation was canceled",
         })));
     }
-    let skip_flow_update = job
-        .args
-        .as_ref()
-        .map(|x| {
-            x.get("skip_flow_update")
-                .map(|v| serde_json::from_str::<bool>(v.get()).ok())
-                .flatten()
-        })
-        .flatten()
-        .unwrap_or(false);
 
     if !skip_flow_update {
+        let version = version.ok_or_else(|| {
+            Error::InternalErr("Flow Dependency requires script hash (flow version)".to_owned())
+        })?;
+
         sqlx::query!(
             "UPDATE flow SET value = $1 WHERE path = $2 AND workspace_id = $3",
             new_flow_value,
@@ -547,22 +642,30 @@ pub async fn handle_flow_dependency_job<R: rsmq_async::RsmqConnection + Send + S
         )
         .execute(db)
         .await?;
-    }
-    tx.commit().await?;
+        sqlx::query!(
+            "UPDATE flow_version SET value = $1 WHERE id = $2",
+            new_flow_value,
+            version
+        )
+        .execute(db)
+        .await?;
 
-    if let Err(e) = handle_deployment_metadata(
-        &job.email,
-        &job.created_by,
-        &db,
-        &job.workspace_id,
-        DeployedObject::Flow { path: job_path, parent_path },
-        deployment_message,
-        rsmq.clone(),
-        false,
-    )
-    .await
-    {
-        tracing::error!(%e, "error handling deployment metadata");
+        tx.commit().await?;
+
+        if let Err(e) = handle_deployment_metadata(
+            &job.email,
+            &job.created_by,
+            &db,
+            &job.workspace_id,
+            DeployedObject::Flow { path: job_path, parent_path, version },
+            deployment_message,
+            rsmq.clone(),
+            false,
+        )
+        .await
+        {
+            tracing::error!(%e, "error handling deployment metadata");
+        }
     }
 
     Ok(to_raw_value_owned(json!({
@@ -611,6 +714,7 @@ async fn lock_modules<'c>(
     base_internal_url: &str,
     token: &str,
     locks_to_reload: &Option<Vec<String>>,
+    occupancy_metrics: &mut OccupancyMetrics,
     // (modules to replace old seq (even unmmodified ones), new transaction, modified ids) )
 ) -> Result<(
     Vec<FlowModule>,
@@ -625,7 +729,7 @@ async fn lock_modules<'c>(
             lock,
             path,
             content,
-            language,
+            mut language,
             input_transforms,
             tag,
             custom_concurrency_key,
@@ -656,6 +760,7 @@ async fn lock_modules<'c>(
                         base_internal_url,
                         token,
                         locks_to_reload,
+                        occupancy_metrics,
                     ))
                     .await?;
                     e.value = FlowModuleValue::ForloopFlow {
@@ -687,6 +792,7 @@ async fn lock_modules<'c>(
                             base_internal_url,
                             token,
                             locks_to_reload,
+                            occupancy_metrics,
                         ))
                         .await?;
                         nmodified_ids.extend(inner_modified_ids);
@@ -711,6 +817,7 @@ async fn lock_modules<'c>(
                         base_internal_url,
                         token,
                         locks_to_reload,
+                        occupancy_metrics,
                     ))
                     .await?;
                     e.value =
@@ -737,6 +844,7 @@ async fn lock_modules<'c>(
                             base_internal_url,
                             token,
                             locks_to_reload,
+                            occupancy_metrics,
                         ))
                         .await?;
                         nmodified_ids.extend(inner_modified_ids);
@@ -758,6 +866,7 @@ async fn lock_modules<'c>(
                         base_internal_url,
                         token,
                         locks_to_reload,
+                        occupancy_metrics,
                     ))
                     .await?;
                     e.value = FlowModuleValue::BranchOne { branches: nbranches, default: ndefault }
@@ -777,8 +886,11 @@ async fn lock_modules<'c>(
             }
         } else {
             if lock.as_ref().is_some_and(|x| !x.trim().is_empty()) {
-                new_flow_modules.push(e);
-                continue;
+                let skip_creating_new_lock = skip_creating_new_lock(&language, &content);
+                if skip_creating_new_lock {
+                    new_flow_modules.push(e);
+                    continue;
+                }
             }
         }
 
@@ -802,6 +914,8 @@ async fn lock_modules<'c>(
                 &path.clone().unwrap_or_else(|| job_path.to_string())
             ),
             false,
+            None,
+            occupancy_metrics,
         )
         .await;
         //
@@ -816,8 +930,11 @@ async fn lock_modules<'c>(
                     &Some(e.id.clone()),
                 )
                 .await?;
-                let relative_imports =
-                    extract_relative_imports(&content, &dep_path, &Some(language.clone()));
+                let relative_imports = extract_relative_imports(
+                    &content,
+                    &format!("{dep_path}/flow"),
+                    &Some(language.clone()),
+                );
                 if let Some(relative_imports) = relative_imports {
                     let mut logs = "".to_string();
                     logs.push_str(format!("\n\n--- RELATIVE IMPORTS of {} ---\n\n", e.id).as_str());
@@ -835,6 +952,14 @@ async fn lock_modules<'c>(
                     append_logs(&job.id, &job.workspace_id, logs, db).await;
                 }
 
+                if language == ScriptLang::Bun || language == ScriptLang::Bunnative {
+                    let anns = windmill_common::worker::TypeScriptAnnotations::parse(&content);
+                    if anns.native && language == ScriptLang::Bun {
+                        language = ScriptLang::Bunnative;
+                    } else if !anns.native && language == ScriptLang::Bunnative {
+                        language = ScriptLang::Bun;
+                    };
+                }
                 e.value = windmill_common::worker::to_raw_value(&FlowModuleValue::RawScript {
                     lock: Some(new_lock),
                     path,
@@ -876,6 +1001,18 @@ async fn lock_modules<'c>(
     Ok((new_flow_modules, tx, modified_ids))
 }
 
+fn skip_creating_new_lock(language: &ScriptLang, content: &str) -> bool {
+    if language == &ScriptLang::Bun || language == &ScriptLang::Bunnative {
+        let anns = windmill_common::worker::TypeScriptAnnotations::parse(&content);
+        if anns.native && language == &ScriptLang::Bun {
+            return false;
+        } else if !anns.native && language == &ScriptLang::Bunnative {
+            return false;
+        };
+    }
+    true
+}
+
 #[async_recursion]
 async fn lock_modules_app(
     value: Value,
@@ -889,6 +1026,7 @@ async fn lock_modules_app(
     job_path: &str,
     base_internal_url: &str,
     token: &str,
+    occupancy_metrics: &mut OccupancyMetrics,
 ) -> Result<Value> {
     match value {
         Value::Object(mut m) => {
@@ -909,10 +1047,12 @@ async fn lock_modules_app(
                             if v.get("lock")
                                 .is_some_and(|x| !x.as_str().unwrap().trim().is_empty())
                             {
-                                logs.push_str(
-                                    "Found already locked inline script. Skipping lock...\n",
-                                );
-                                return Ok(Value::Object(m.clone()));
+                                if skip_creating_new_lock(&language, &content) {
+                                    logs.push_str(
+                                        "Found already locked inline script. Skipping lock...\n",
+                                    );
+                                    return Ok(Value::Object(m.clone()));
+                                }
                             }
                             logs.push_str("Found lockable inline script. Generating lock...\n");
                             let new_lock = capture_dependency_job(
@@ -930,11 +1070,30 @@ async fn lock_modules_app(
                                 token,
                                 &format!("{}/app", job.script_path()),
                                 false,
+                                None,
+                                occupancy_metrics,
                             )
                             .await;
                             match new_lock {
                                 Ok(new_lock) => {
                                     append_logs(&job.id, &job.workspace_id, logs, db).await;
+                                    let anns =
+                                        windmill_common::worker::TypeScriptAnnotations::parse(
+                                            &content,
+                                        );
+                                    let nlang = if anns.native && language == ScriptLang::Bun {
+                                        Some(ScriptLang::Bunnative)
+                                    } else if !anns.native && language == ScriptLang::Bunnative {
+                                        Some(ScriptLang::Bun)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(nlang) = nlang {
+                                        v.insert(
+                                            "language".to_string(),
+                                            serde_json::Value::String(nlang.as_str().to_string()),
+                                        );
+                                    }
                                     v.insert(
                                         "lock".to_string(),
                                         serde_json::Value::String(new_lock),
@@ -970,6 +1129,7 @@ async fn lock_modules_app(
                         job_path,
                         base_internal_url,
                         token,
+                        occupancy_metrics,
                     )
                     .await?,
                 );
@@ -992,6 +1152,7 @@ async fn lock_modules_app(
                         job_path,
                         base_internal_url,
                         token,
+                        occupancy_metrics,
                     )
                     .await?,
                 );
@@ -1013,17 +1174,18 @@ pub async fn handle_app_dependency_job<R: rsmq_async::RsmqConnection + Send + Sy
     base_internal_url: &str,
     token: &str,
     rsmq: Option<R>,
+    occupancy_metrics: &mut OccupancyMetrics,
 ) -> error::Result<()> {
     let job_path = job.script_path.clone().ok_or_else(|| {
         error::Error::InternalErr(
-            "Cannot resolve flow dependencies for flow without path".to_string(),
+            "Cannot resolve app dependencies for app without path".to_string(),
         )
     })?;
 
     let id = job
         .script_hash
         .clone()
-        .ok_or_else(|| Error::InternalErr("Flow Dependency requires script hash".to_owned()))?
+        .ok_or_else(|| Error::InternalErr("App Dependency requires script hash".to_owned()))?
         .0;
     let value = sqlx::query_scalar!("SELECT value FROM app_version WHERE id = $1", id)
         .fetch_optional(db)
@@ -1042,10 +1204,11 @@ pub async fn handle_app_dependency_job<R: rsmq_async::RsmqConnection + Send + Sy
             &job_path,
             base_internal_url,
             token,
+            occupancy_metrics,
         )
         .await?;
 
-        // Re-check cancelation to ensure we don't accidentially override a flow.
+        // Re-check cancelation to ensure we don't accidentially override an app.
         if sqlx::query_scalar!("SELECT canceled FROM queue WHERE id = $1", job.id)
             .fetch_optional(db)
             .await
@@ -1106,6 +1269,59 @@ pub async fn handle_app_dependency_job<R: rsmq_async::RsmqConnection + Send + Sy
     }
 }
 
+async fn python_dep(
+    reqs: String,
+    job_id: &Uuid,
+    mem_peak: &mut i32,
+    canceled_by: &mut Option<CanceledBy>,
+    job_dir: &str,
+    db: &sqlx::Pool<sqlx::Postgres>,
+    worker_name: &str,
+    w_id: &str,
+    worker_dir: &str,
+    occupancy_metrics: &mut Option<&mut OccupancyMetrics>,
+) -> std::result::Result<String, Error> {
+    create_dependencies_dir(job_dir).await;
+    let req: std::result::Result<String, Error> = uv_pip_compile(
+        job_id,
+        &reqs,
+        mem_peak,
+        canceled_by,
+        job_dir,
+        db,
+        worker_name,
+        w_id,
+        occupancy_metrics,
+        false,
+        false,
+    )
+    .await;
+    // install the dependencies to pre-fill the cache
+    if let Ok(req) = req.as_ref() {
+        let r = handle_python_reqs(
+            req.split("\n").filter(|x| !x.starts_with("--")).collect(),
+            job_id,
+            w_id,
+            mem_peak,
+            canceled_by,
+            db,
+            worker_name,
+            job_dir,
+            worker_dir,
+            occupancy_metrics,
+        )
+        .await;
+
+        if let Err(e) = r {
+            tracing::error!(
+                "Failed to install python dependencies to prefill the cache: {:?} \n",
+                e
+            );
+        }
+    }
+    req
+}
+
 async fn capture_dependency_job(
     job_id: &Uuid,
     job_language: &ScriptLang,
@@ -1121,6 +1337,8 @@ async fn capture_dependency_job(
     token: &str,
     script_path: &str,
     raw_deps: bool,
+    npm_mode: Option<bool>,
+    occupancy_metrics: &mut OccupancyMetrics,
 ) -> error::Result<String> {
     match job_language {
         ScriptLang::Python3 => {
@@ -1139,41 +1357,43 @@ async fn capture_dependency_job(
                 .await?
                 .join("\n")
             };
-            create_dependencies_dir(job_dir).await;
-            let req: std::result::Result<String, Error> = pip_compile(
+
+            python_dep(
+                reqs,
                 job_id,
-                &reqs,
                 mem_peak,
                 canceled_by,
                 job_dir,
                 db,
                 worker_name,
                 w_id,
+                worker_dir,
+                &mut Some(occupancy_metrics),
             )
-            .await;
-            // install the dependencies to pre-fill the cache
-            if let Ok(req) = req.as_ref() {
-                let r = handle_python_reqs(
-                    req.split("\n").filter(|x| !x.starts_with("--")).collect(),
-                    job_id,
-                    w_id,
-                    mem_peak,
-                    canceled_by,
-                    db,
-                    worker_name,
-                    job_dir,
-                    worker_dir,
-                )
-                .await;
-
-                if let Err(e) = r {
-                    tracing::error!(
-                        "Failed to install python dependencies to prefill the cache: {:?} \n",
-                        e
-                    );
-                }
+            .await
+        }
+        ScriptLang::Ansible => {
+            if raw_deps {
+                return Err(Error::ExecutionErr(
+                    "Raw dependencies not supported for ansible".to_string(),
+                ));
             }
-            req
+            let (_logs, reqs, _) = windmill_parser_yaml::parse_ansible_reqs(job_raw_code)?;
+            let reqs = reqs.map(|r| r.python_reqs.join("\n")).unwrap_or_default();
+
+            python_dep(
+                reqs,
+                job_id,
+                mem_peak,
+                canceled_by,
+                job_dir,
+                db,
+                worker_name,
+                w_id,
+                worker_dir,
+                &mut Some(occupancy_metrics),
+            )
+            .await
         }
         ScriptLang::Go => {
             if raw_deps {
@@ -1193,6 +1413,7 @@ async fn capture_dependency_job(
                 false,
                 worker_name,
                 w_id,
+                occupancy_metrics,
             )
             .await
         }
@@ -1208,23 +1429,27 @@ async fn capture_dependency_job(
                 mem_peak,
                 canceled_by,
                 job_dir,
-                db,
+                Some(db),
                 w_id,
                 worker_name,
                 base_internal_url,
+                &mut Some(occupancy_metrics),
             )
             .await
         }
-        ScriptLang::Bun => {
+        ScriptLang::Bun | ScriptLang::Bunnative => {
+            let npm_mode = npm_mode.unwrap_or_else(|| {
+                windmill_common::worker::TypeScriptAnnotations::parse(job_raw_code).npm
+            });
             if !raw_deps {
-                let _ = write_file(job_dir, "main.ts", job_raw_code).await?;
+                let _ = write_file(job_dir, "main.ts", job_raw_code)?;
             }
-            let req = gen_lockfile(
+            let req = gen_bun_lockfile(
                 mem_peak,
                 canceled_by,
                 job_id,
                 w_id,
-                db,
+                Some(db),
                 token,
                 script_path,
                 job_dir,
@@ -1236,9 +1461,26 @@ async fn capture_dependency_job(
                 } else {
                     None
                 },
-                false,
+                npm_mode,
+                &mut Some(occupancy_metrics),
             )
             .await?;
+            if req.is_some() && !raw_deps {
+                crate::bun_executor::prebundle_bun_script(
+                    job_raw_code,
+                    req.clone(),
+                    script_path,
+                    job_id,
+                    w_id,
+                    Some(db.clone()),
+                    &job_dir,
+                    base_internal_url,
+                    worker_name,
+                    &token,
+                    &mut Some(occupancy_metrics),
+                )
+                .await?;
+            }
             Ok(req.unwrap_or_else(String::new))
         }
         ScriptLang::Php => {
@@ -1266,8 +1508,44 @@ async fn capture_dependency_job(
                 worker_name,
                 reqs,
                 None,
+                occupancy_metrics,
             )
             .await
+        }
+        ScriptLang::Rust => {
+            if raw_deps {
+                return Err(Error::ExecutionErr(
+                    "Raw dependencies not supported for rust".to_string(),
+                ));
+            }
+
+            let lockfile = generate_cargo_lockfile(
+                job_id,
+                job_raw_code,
+                mem_peak,
+                canceled_by,
+                job_dir,
+                db,
+                worker_name,
+                w_id,
+                occupancy_metrics,
+            )
+            .await?;
+
+            build_rust_crate(
+                job_id,
+                mem_peak,
+                canceled_by,
+                job_dir,
+                db,
+                worker_name,
+                w_id,
+                base_internal_url,
+                &compute_rust_hash(&job_raw_code, Some(&lockfile)),
+                occupancy_metrics,
+            )
+            .await?;
+            Ok(lockfile)
         }
         ScriptLang::Postgresql => Ok("".to_owned()),
         ScriptLang::Mysql => Ok("".to_owned()),

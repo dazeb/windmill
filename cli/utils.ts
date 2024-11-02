@@ -3,6 +3,7 @@
 // @ts-nocheck This file is copied from a JS project, so it's not type-safe.
 
 import { log, encodeHex, SEP } from "./deps.ts";
+import crypto from "node:crypto";
 
 export function deepEqual<T>(a: T, b: T): boolean {
   if (a === b) return true;
@@ -54,7 +55,10 @@ export function deepEqual<T>(a: T, b: T): boolean {
     if (a.valueOf !== Object.prototype.valueOf) {
       return a.valueOf() === b.valueOf();
     }
-    if (a.toString !== Object.prototype.toString) {
+    if (
+      a.toString !== Object.prototype.toString &&
+      typeof a.toString == "function"
+    ) {
       return a.toString() === b.toString();
     }
 
@@ -93,17 +97,17 @@ export function getHeaders(): Record<string, string> | undefined {
   }
 }
 
-export async function digestDir(path: string) {
+export async function digestDir(path: string, conf: string) {
   const hashes: string = [];
   for await (const e of Deno.readDir(path)) {
     const npath = path + "/" + e.name;
     if (e.isFile) {
       hashes.push(await generateHashFromBuffer(await Deno.readFile(npath)));
     } else if (e.isDirectory && !e.isSymlink) {
-      hashes.push(await digestDir(npath));
+      hashes.push(await digestDir(npath, ""));
     }
   }
-  return await generateHash(hashes.join(""));
+  return await generateHash(hashes.join("") + conf);
 }
 
 export async function generateHash(content: string): Promise<string> {
@@ -124,4 +128,17 @@ export async function generateHashFromBuffer(
 
 export function readInlinePathSync(path: string): string {
   return Deno.readTextFileSync(path.replaceAll("/", SEP));
+}
+
+export function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function isFileResource(path: string): boolean {
+  const splitPath = path.split(".");
+  return (
+    splitPath.length >= 4 &&
+    splitPath[1] == "resource" &&
+    splitPath[2] == "file"
+  );
 }

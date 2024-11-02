@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { createPopperActions, type PopperOptions } from 'svelte-popperjs'
 	import type { PopoverPlacement } from './Popover.model'
-	import Portal from 'svelte-portal'
+	import Portal from '$lib/components/Portal.svelte'
+
 	import { ExternalLink } from 'lucide-svelte'
 
 	export let placement: PopoverPlacement = 'bottom-end'
@@ -66,7 +67,7 @@
 	</button>
 {/if}
 {#if showTooltip && !disablePopup}
-	<Portal>
+	<Portal name="popover">
 		<!-- svelte-ignore a11y-no-static-element-interactions -->
 		<div
 			use:popperContent={popperOptions}

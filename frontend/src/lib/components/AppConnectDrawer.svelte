@@ -6,6 +6,8 @@
 	import AppConnectInner from './AppConnectInner.svelte'
 	import DarkModeObserver from './DarkModeObserver.svelte'
 
+	export let expressOAuthSetup = false
+
 	let drawer: Drawer
 	let resourceType = ''
 	let step = 1
@@ -21,7 +23,11 @@
 		drawer.openDrawer?.()
 	}
 
-	$: appConnectInner?.open(rtToLoad)
+	$: appConnectInner && onRtToLoadChange(rtToLoad)
+
+	function onRtToLoadChange(rtToLoad: string | undefined) {
+		appConnectInner?.open(rtToLoad)
+	}
 
 	const dispatch = createEventDispatcher()
 
@@ -53,6 +59,7 @@
 			bind:manual
 			on:close={drawer?.closeDrawer}
 			on:refresh
+			express={expressOAuthSetup}
 		/>
 		<div slot="actions" class="flex gap-1">
 			{#if step > 1}

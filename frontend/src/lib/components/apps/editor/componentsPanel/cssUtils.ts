@@ -27,6 +27,7 @@ export const authorizedClassnames = [
 	'wm-currency-input',
 	'wm-date-input',
 	'wm-text-input',
+	'wm-user-resource-select',
 	'wm-html',
 	'wm-table-container',
 	'wm-table-header',
@@ -336,6 +337,17 @@ export const customisationByComponent: Customisation[] = [
 		variables: []
 	},
 	{
+		components: ['userresourcecomponent'],
+		selectors: [
+			{
+				selector: '.wm-user-resource-select',
+				comment: 'User resource select',
+				customCssKey: 'input'
+			}
+		],
+		variables: []
+	},
+	{
 		components: ['htmlcomponent'],
 		selectors: [{ selector: '.wm-html', comment: 'HTML component', customCssKey: 'container' }],
 		variables: []
@@ -567,7 +579,7 @@ export const customisationByComponent: Customisation[] = [
 	{
 		components: ['conditionalwrapper'],
 		selectors: [
-			{ selector: '.wm-conditional-tabs', comment: 'Conditional tabs', customCssKey: 'container' }
+			{ selector: '.wm-conditional-tabs', comment: 'Conditional Tabs', customCssKey: 'container' }
 		],
 		variables: []
 	},

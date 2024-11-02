@@ -1,3 +1,4 @@
+use const_format::concatcp;
 use itertools::Itertools;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -5,17 +6,25 @@ use serde_json::value::RawValue;
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
+    fs::File,
+    io::Write,
+    path::{Component, Path, PathBuf},
+    str::FromStr,
     sync::{atomic::AtomicBool, Arc},
 };
 use tokio::sync::RwLock;
+use windmill_macros::annotations;
 
-use crate::{error, global_settings::CUSTOM_TAGS_SETTING, server::ServerConfig, DB};
+use crate::{error, global_settings::CUSTOM_TAGS_SETTING, server::Smtp, DB};
 
 lazy_static::lazy_static! {
     pub static ref WORKER_GROUP: String = std::env::var("WORKER_GROUP").unwrap_or_else(|_| "default".to_string());
     pub static ref NO_LOGS: bool = std::env::var("NO_LOGS").ok().is_some_and(|x| x == "1" || x == "true");
 
-
+    pub static ref CGROUP_V2_PATH_RE: Regex = Regex::new(r#"(?m)^0::(/.*)$"#).unwrap();
+    pub static ref CGROUP_V2_CPU_RE: Regex = Regex::new(r#"(?m)^(\d+) \S+$"#).unwrap();
+    pub static ref CGROUP_V1_INACTIVE_FILE_RE: Regex = Regex::new(r#"(?m)^total_inactive_file (\d+)$"#).unwrap();
+    pub static ref CGROUP_V2_INACTIVE_FILE_RE: Regex = Regex::new(r#"(?m)^inactive_file (\d+)$"#).unwrap();
 
     pub static ref DEFAULT_TAGS: Vec<String> = vec![
         "deno".to_string(),
@@ -32,12 +41,15 @@ lazy_static::lazy_static! {
         "mssql".to_string(),
         "graphql".to_string(),
         "php".to_string(),
+        "rust".to_string(),
+        "ansible".to_string(),
         "dependency".to_string(),
         "flow".to_string(),
         "other".to_string()
     ];
 
     pub static ref DEFAULT_TAGS_PER_WORKSPACE: AtomicBool = AtomicBool::new(false);
+    pub static ref DEFAULT_TAGS_WORKSPACES: Arc<RwLock<Option<Vec<String>>>> = Arc::new(RwLock::new(None));
 
 
     pub static ref WORKER_CONFIG: Arc<RwLock<WorkerConfig>> = Arc::new(RwLock::new(WorkerConfig {
@@ -51,8 +63,11 @@ lazy_static::lazy_static! {
         env_vars: Default::default(),
     }));
 
-    pub static ref SERVER_CONFIG: Arc<RwLock<ServerConfig>> = Arc::new(RwLock::new(ServerConfig { smtp: Default::default(), timeout_wait_result: 20 }));
+    pub static ref WORKER_PULL_QUERIES: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(vec![]));
+    pub static ref WORKER_SUSPENDED_PULL_QUERY: Arc<RwLock<String>> = Arc::new(RwLock::new("".to_string()));
 
+
+    pub static ref SMTP_CONFIG: Arc<RwLock<Option<Smtp>>> = Arc::new(RwLock::new(None));
 
 
     pub static ref CLOUD_HOSTED: bool = std::env::var("CLOUD_HOSTED").is_ok();
@@ -68,9 +83,151 @@ lazy_static::lazy_static! {
 
     static ref CUSTOM_TAG_REGEX: Regex =  Regex::new(r"^(\w+)\(((?:\w+)\+?)+\)$").unwrap();
 
+    pub static ref DISABLE_BUNDLING: bool = std::env::var("DISABLE_BUNDLING")
+    .ok()
+    .and_then(|x| x.parse::<bool>().ok())
+    .unwrap_or(false);
+
+}
+
+pub async fn make_suspended_pull_query(wc: &WorkerConfig) {
+    if wc.worker_tags.len() == 0 {
+        tracing::error!("Empty tags in worker tags, skipping");
+        return;
+    }
+    let query = format!(
+        "UPDATE queue
+            SET running = true
+              , started_at = coalesce(started_at, now())
+              , last_ping = now()
+              , suspend_until = null
+            WHERE id = (
+                SELECT id
+                FROM queue
+                WHERE suspend_until IS NOT NULL AND (suspend <= 0 OR suspend_until <= now()) AND tag IN ({})
+                ORDER BY priority DESC NULLS LAST, created_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            RETURNING  id,  workspace_id,  parent_job,  created_by,  created_at,  started_at,  scheduled_for,
+            running,  script_hash,  script_path,  args,   null as logs,  raw_code,  canceled,  canceled_by,
+            canceled_reason,  last_ping,  job_kind, schedule_path,  permissioned_as,
+            flow_status,  raw_flow,  is_flow_step,  language,  suspend,  suspend_until,
+            same_worker,  raw_lock,  pre_run_error,  email,  visible_to_owner,  mem_peak,
+             root_job,  leaf_jobs,  tag,  concurrent_limit,  concurrency_time_window_s,
+             timeout,  flow_step_id,  cache_ttl, priority", wc.worker_tags.iter().map(|x| format!("'{x}'")).join(", "));
+    let mut l = WORKER_SUSPENDED_PULL_QUERY.write().await;
+    *l = query;
+}
+
+pub async fn make_pull_query(wc: &WorkerConfig) {
+    let mut queries = vec![];
+    for tags in wc.priority_tags_sorted.iter() {
+        if tags.tags.len() == 0 {
+            tracing::error!("Empty tags in priority tags, skipping");
+            continue;
+        }
+        let query = format!("UPDATE queue
+        SET running = true
+        , started_at = coalesce(started_at, now())
+        , last_ping = now()
+        , suspend_until = null
+        WHERE id = (
+            SELECT id
+            FROM queue
+            WHERE running = false AND tag IN ({}) AND scheduled_for <= now()
+            ORDER BY priority DESC NULLS LAST, scheduled_for
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        )
+        RETURNING  id,  workspace_id,  parent_job,  created_by,  created_at,  started_at,  scheduled_for,
+        running,  script_hash,  script_path,  args,  null as logs,  raw_code,  canceled,  canceled_by,
+        canceled_reason,  last_ping,  job_kind,  schedule_path,  permissioned_as,
+        flow_status,  raw_flow,  is_flow_step,  language,  suspend,  suspend_until,
+        same_worker,  raw_lock,  pre_run_error,  email,  visible_to_owner,  mem_peak,
+         root_job,  leaf_jobs,  tag,  concurrent_limit,  concurrency_time_window_s,
+         timeout,  flow_step_id,  cache_ttl, priority", tags.tags.iter().map(|x| format!("'{x}'")).join(", "));
+
+        queries.push(query);
+    }
+
+    let mut l = WORKER_PULL_QUERIES.write().await;
+    *l = queries;
 }
 
 pub const TMP_DIR: &str = "/tmp/windmill";
+pub const HUB_CACHE_DIR: &str = concatcp!(ROOT_CACHE_DIR, "hub");
+
+pub const ROOT_CACHE_DIR: &str = concatcp!(TMP_DIR, "/cache/");
+
+pub fn write_file(dir: &str, path: &str, content: &str) -> error::Result<File> {
+    let path = format!("{}/{}", dir, path);
+    let mut file = File::create(&path)?;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    Ok(file)
+}
+
+/// from : https://github.com/rust-lang/cargo/blob/fede83ccf973457de319ba6fa0e36ead454d2e20/src/cargo/util/paths.rs#L61
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = path.components().peekable();
+    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
+        components.next();
+        PathBuf::from(c.as_os_str())
+    } else {
+        PathBuf::new()
+    };
+
+    for component in components {
+        match component {
+            Component::Prefix(..) => unreachable!(),
+            Component::RootDir => {
+                ret.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ret.pop();
+            }
+            Component::Normal(c) => {
+                ret.push(c);
+            }
+        }
+    }
+    ret
+}
+pub fn write_file_at_user_defined_location(
+    job_dir: &str,
+    user_defined_path: &str,
+    content: &str,
+) -> error::Result<PathBuf> {
+    let job_dir = Path::new(job_dir);
+    let user_path = PathBuf::from(user_defined_path);
+
+    let full_path = job_dir.join(&user_path);
+
+    // let normalized_job_dir = std::fs::canonicalize(job_dir)?;
+    // let normalized_full_path = std::fs::canonicalize(&full_path)?;
+    let normalized_job_dir = normalize_path(job_dir);
+    let normalized_full_path = normalize_path(&full_path);
+
+    if !normalized_full_path.starts_with(&normalized_job_dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Path is outside the allowed job directory.",
+        )
+        .into());
+    }
+
+    let full_path = normalized_full_path.as_path();
+    if let Some(parent_dir) = full_path.parent() {
+        std::fs::create_dir_all(parent_dir)?;
+    }
+
+    let mut file = File::create(full_path)?;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    Ok(normalized_full_path)
+}
 
 pub async fn reload_custom_tags_setting(db: &DB) -> error::Result<()> {
     let q = sqlx::query!(
@@ -132,156 +289,238 @@ fn process_custom_tags(tags: Vec<String>) -> (Vec<String>, HashMap<String, Vec<S
     (global, specific)
 }
 
-pub fn get_vcpus() -> Option<i64> {
-    let mut vcpus = std::process::Command::new("cat")
-        .args(["/sys/fs/cgroup/cpu.max"])
+fn parse_file<T: FromStr>(path: &str) -> Option<T> {
+    std::process::Command::new("cat")
+        .args([path])
         .output()
         .ok()
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .to_string()
-                .split(" ")
-                .map(|s| s.to_string())
-                .collect::<Vec<String>>()
-                .get(0)
-                .map(|s| s.to_string().trim().parse::<i64>().ok())
-                .flatten()
+                .trim()
+                .parse::<T>()
+                .ok()
         })
         .flatten()
-        .map(|x| if x > 0 { Some(x) } else { None })
-        .flatten();
+}
 
-    if vcpus.is_none() {
-        vcpus = std::process::Command::new("cat")
-            .args(["/sys/fs/cgroup/cpu/cpu.cfs_quota_us"])
-            .output()
-            .ok()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .to_string()
-                    .trim()
-                    .parse::<i64>()
-                    .ok()
+#[annotations("#")]
+pub struct PythonAnnotations {
+    pub no_cache: bool,
+    pub no_uv: bool,
+}
+
+#[annotations("//")]
+pub struct TypeScriptAnnotations {
+    pub npm: bool,
+    pub nodejs: bool,
+    pub native: bool,
+    pub nobundling: bool,
+}
+
+#[annotations("--")]
+pub struct SqlAnnotations {
+    pub return_last_result: bool,
+}
+
+pub async fn load_cache(bin_path: &str, _remote_path: &str) -> (bool, String) {
+    if tokio::fs::metadata(&bin_path).await.is_ok() {
+        (true, format!("loaded from local cache: {}\n", bin_path))
+    } else {
+        #[cfg(all(feature = "enterprise", feature = "parquet"))]
+        if let Some(os) = crate::s3_helpers::OBJECT_STORE_CACHE_SETTINGS
+            .read()
+            .await
+            .clone()
+        {
+            let started = std::time::Instant::now();
+            use crate::s3_helpers::attempt_fetch_bytes;
+
+            if let Ok(mut x) = attempt_fetch_bytes(os, _remote_path).await {
+                if let Err(e) = write_binary_file(bin_path, &mut x) {
+                    tracing::error!("could not write bundle/bin file locally: {e:?}");
+                    return (
+                        false,
+                        "error writing bundle/bin file from object store".to_string(),
+                    );
+                }
+                tracing::info!("loaded from object store {}", bin_path);
+                return (
+                    true,
+                    format!(
+                        "loaded bin/bundle from object store {} in {}ms",
+                        bin_path,
+                        started.elapsed().as_millis()
+                    ),
+                );
+            }
+        }
+        (false, "".to_string())
+    }
+}
+
+pub async fn exists_in_cache(bin_path: &str, _remote_path: &str) -> bool {
+    if tokio::fs::metadata(&bin_path).await.is_ok() {
+        return true;
+    } else {
+        #[cfg(all(feature = "enterprise", feature = "parquet"))]
+        if let Some(os) = crate::s3_helpers::OBJECT_STORE_CACHE_SETTINGS
+            .read()
+            .await
+            .clone()
+        {
+            return os
+                .get(&object_store::path::Path::from(_remote_path))
+                .await
+                .is_ok();
+        }
+        return false;
+    }
+}
+
+pub async fn save_cache(
+    local_cache_path: &str,
+    _remote_cache_path: &str,
+    origin: &str,
+) -> crate::error::Result<String> {
+    let mut _cached_to_s3 = false;
+    #[cfg(all(feature = "enterprise", feature = "parquet"))]
+    if let Some(os) = crate::s3_helpers::OBJECT_STORE_CACHE_SETTINGS
+        .read()
+        .await
+        .clone()
+    {
+        use object_store::path::Path;
+
+        if let Err(e) = os
+            .put(
+                &Path::from(_remote_cache_path),
+                std::fs::read(origin)?.into(),
+            )
+            .await
+        {
+            tracing::error!(
+                "Failed to put go bin to object store: {_remote_cache_path}. Error: {:?}",
+                e
+            );
+        } else {
+            _cached_to_s3 = true;
+        }
+    }
+
+    // if !*CLOUD_HOSTED {
+    if true {
+        std::fs::copy(origin, local_cache_path)?;
+        Ok(format!(
+            "\nwrote cached binary: {} (backed by EE distributed object store: {_cached_to_s3})\n",
+            local_cache_path
+        ))
+    } else if _cached_to_s3 {
+        Ok(format!(
+            "wrote cached binary to object store {}\n",
+            local_cache_path
+        ))
+    } else {
+        Ok("".to_string())
+    }
+}
+
+#[cfg(all(feature = "enterprise", feature = "parquet"))]
+fn write_binary_file(main_path: &str, byts: &mut bytes::Bytes) -> error::Result<()> {
+    use std::fs::{File, Permissions};
+    use std::io::Write;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut file = File::create(main_path)?;
+    file.write_all(byts)?;
+    #[cfg(unix)]
+    file.set_permissions(Permissions::from_mode(0o755))?;
+    file.flush()?;
+    Ok(())
+}
+
+fn get_cgroupv2_path() -> Option<String> {
+    let cgroup_path: String = parse_file("/proc/self/cgroup")?;
+
+    CGROUP_V2_PATH_RE
+        .captures(&cgroup_path)
+        .map(|x| format!("/sys/fs/cgroup{}", x.get(1).unwrap().as_str()))
+}
+
+pub fn get_vcpus() -> Option<i64> {
+    if Path::new("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").exists() {
+        // cgroup v1
+        parse_file("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+            .map(|x: i64| if x > 0 { Some(x) } else { None })
+            .flatten()
+    } else {
+        // cgroup v2
+        let cgroup_path = get_cgroupv2_path()?;
+
+        let cpu_max_path = format!("{cgroup_path}/cpu.max");
+
+        parse_file(&cpu_max_path)
+            .map(|x: String| {
+                CGROUP_V2_CPU_RE
+                    .captures(&x)
+                    .map(|x| x.get(1).unwrap().as_str().parse::<i64>().ok())
+                    .flatten()
             })
             .flatten()
             .map(|x| if x > 0 { Some(x) } else { None })
-            .flatten();
+            .flatten()
     }
-
-    vcpus
 }
 
 pub fn get_memory() -> Option<i64> {
-    let mut memory = std::process::Command::new("cat")
-        .args(["/sys/fs/cgroup/memory.max"])
-        .output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .to_string()
-                .trim()
-                .parse::<i64>()
-                .ok()
-        })
-        .flatten();
+    if Path::new("/sys/fs/cgroup/memory/memory.limit_in_bytes").exists() {
+        // cgroup v1
+        parse_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    } else {
+        // cgroup v2
+        let cgroup_path = get_cgroupv2_path()?;
+        let memory_max_path = format!("{cgroup_path}/memory.max");
 
-    if memory.is_none() {
-        memory = std::process::Command::new("cat")
-            .args(["/sys/fs/cgroup/memory/memory.limit_in_bytes"])
-            .output()
-            .ok()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .to_string()
-                    .trim()
-                    .parse::<i64>()
-                    .ok()
-            })
-            .flatten()
+        parse_file(&memory_max_path)
     }
-
-    memory
 }
 
 pub fn get_worker_memory_usage() -> Option<i64> {
-    let mut total_memory_usage = std::process::Command::new("cat")
-        .args(["/sys/fs/cgroup/memory.current"])
-        .output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .to_string()
-                .trim()
-                .parse::<i64>()
-                .ok()
-        })
-        .flatten();
+    if Path::new("/sys/fs/cgroup/memory/memory.usage_in_bytes").exists() {
+        // cgroup v1
+        let total_memory_usage: i64 = parse_file("/sys/fs/cgroup/memory/memory.usage_in_bytes")?;
 
-    if total_memory_usage.is_none() {
-        total_memory_usage = std::process::Command::new("cat")
-            .args(["/sys/fs/cgroup/memory/memory.usage_in_bytes"])
-            .output()
-            .ok()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .to_string()
-                    .trim()
-                    .parse::<i64>()
-                    .ok()
+        let inactive_file = parse_file("/sys/fs/cgroup/memory/memory.stat")
+            .map(|x: String| {
+                CGROUP_V1_INACTIVE_FILE_RE
+                    .captures(&x)
+                    .map(|x| x.get(1).unwrap().as_str().parse::<i64>().ok())
+                    .flatten()
             })
-            .flatten()
-    }
+            .flatten()?;
 
-    match total_memory_usage {
-        Some(total_memory_usage) => {
-            let mut inactive_file = std::process::Command::new("cat")
-                .args(["/sys/fs/cgroup/memory.stat"])
-                .output()
-                .ok()
-                .map(|o| {
-                    String::from_utf8_lossy(&o.stdout)
-                        .to_string()
-                        .split("\n")
-                        .find(|s| s.starts_with("inactive_file"))
-                        .map(|s| {
-                            s.split(" ")
-                                .collect::<Vec<&str>>()
-                                .get(1)
-                                .map(|s| s.trim().parse::<i64>().ok())
-                                .flatten()
-                        })
-                        .flatten()
-                })
-                .flatten();
+        Some(total_memory_usage - inactive_file)
+    } else {
+        // cgroup v2
+        let cgroup_path = get_cgroupv2_path()?;
+        let memory_current_path = format!("{cgroup_path}/memory.current");
 
-            if inactive_file.is_none() {
-                inactive_file = std::process::Command::new("cat")
-                    .args(["/sys/fs/cgroup/memory/memory.stat"])
-                    .output()
-                    .ok()
-                    .map(|o| {
-                        String::from_utf8_lossy(&o.stdout)
-                            .to_string()
-                            .split("\n")
-                            .find(|s| s.starts_with("total_inactive_file"))
-                            .map(|s| {
-                                s.split(" ")
-                                    .collect::<Vec<&str>>()
-                                    .get(1)
-                                    .map(|s| s.trim().parse::<i64>().ok())
-                                    .flatten()
-                            })
-                            .flatten()
-                    })
-                    .flatten();
-            }
+        let total_memory_usage: i64 = parse_file(&memory_current_path)?;
 
-            match inactive_file {
-                Some(inactive_file) => Some(total_memory_usage - inactive_file),
-                None => None,
-            }
-        }
-        None => None,
+        let memory_stat_path = format!("{cgroup_path}/memory.stat");
+
+        let inactive_file = parse_file(&memory_stat_path)
+            .map(|x: String| {
+                CGROUP_V2_INACTIVE_FILE_RE
+                    .captures(&x)
+                    .map(|x| x.get(1).unwrap().as_str().parse::<i64>().ok())
+                    .flatten()
+            })
+            .flatten()?;
+
+        Some(total_memory_usage - inactive_file)
     }
 }
 
@@ -405,6 +644,18 @@ pub async fn load_worker_config(
             .collect_vec();
         all_tags.dedup();
         config.worker_tags = Some(all_tags);
+    }
+
+    if let Some(force_worker_tags) = std::env::var("FORCE_WORKER_TAGS")
+        .ok()
+        .filter(|x| !x.is_empty())
+        .map(|x| x.split(',').map(|x| x.to_string()).collect::<Vec<String>>())
+    {
+        tracing::info!(
+            "Detected FORCE_WORKER_TAGS, forcing worker tags to: {:#?}",
+            force_worker_tags
+        );
+        config.worker_tags = Some(force_worker_tags);
     }
 
     // set worker_tags using default if none. If priority tags is set, compute the sorted priority tags as well

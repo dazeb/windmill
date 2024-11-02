@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { goto } from '$app/navigation'
+	import { goto } from '$lib/navigation'
 	import { page } from '$app/stores'
 	import { Alert, Badge, Drawer, DrawerContent, Tab, Tabs, UndoRedo } from '$lib/components/common'
 	import Button from '$lib/components/common/button/Button.svelte'
@@ -33,14 +33,15 @@
 		Smartphone,
 		FileClock
 	} from 'lucide-svelte'
-	import { getContext } from 'svelte'
+	import { createEventDispatcher, getContext } from 'svelte'
 	import { Pane, Splitpanes } from 'svelte-splitpanes'
 	import {
 		classNames,
 		cleanValueProperties,
 		copyToClipboard,
 		truncateRev,
-		orderedJsonStringify
+		orderedJsonStringify,
+		type Value
 	} from '../../../utils'
 	import type {
 		AppInput,
@@ -82,6 +83,10 @@
 	import { getUpdateInput } from '../components/display/dbtable/queries/update'
 	import { getDeleteInput } from '../components/display/dbtable/queries/delete'
 	import { collectOneOfFields } from './appUtils'
+	import Summary from '$lib/components/Summary.svelte'
+	import ToggleEnable from '$lib/components/common/toggleButton-v2/ToggleEnable.svelte'
+	import HideButton from './settingsPanel/HideButton.svelte'
+	import DeployOverrideConfirmationModal from '$lib/components/common/confirmationModal/DeployOverrideConfirmationModal.svelte'
 
 	async function hash(message) {
 		try {
@@ -114,6 +119,14 @@
 		  }
 		| undefined = undefined
 	export let version: number | undefined = undefined
+	export let leftPanelHidden: boolean = false
+	export let rightPanelHidden: boolean = false
+	export let bottomPanelHidden: boolean = false
+
+	let deployedValue: Value | undefined = undefined // Value to diff against
+	let deployedBy: string | undefined = undefined // Author
+	let confirmCallback: () => void = () => {} // What happens when user clicks `override` in warning
+	let open: boolean = false // Is confirmation modal open
 
 	const {
 		app,
@@ -124,7 +137,8 @@
 		jobsById,
 		staticExporter,
 		errorByComponent,
-		openDebugRun
+		openDebugRun,
+		mode
 	} = getContext<AppViewerContext>('AppViewerContext')
 
 	const { history, jobsDrawerOpen, refreshComponents } =
@@ -229,6 +243,11 @@
 									input: getCountInput(resourceValue, tableValue, dbType, columnDefs, whereClause),
 									id: x.id + '_count'
 								})
+								console.log(
+									x.id,
+									getCountInput(resourceValue, tableValue, dbType, columnDefs, whereClause),
+									columnDefs
+								)
 								r.push({
 									input: getInsertInput(tableValue, columnDefs, resourceValue, dbType),
 									id: x.id + '_insert'
@@ -345,6 +364,49 @@
 			goto(`/apps/edit/${appId}`)
 		} catch (e) {
 			sendUserToast('Error creating app', e)
+		}
+	}
+
+	async function handleUpdateApp(npath: string) {
+		// We have to make sure there is no updates when we clicked the button
+		await compareVersions()
+
+		if (onLatest) {
+			// Handle directly
+			await updateApp(npath)
+		} else {
+			// There is onLatest, but we need more information while deploying
+			// We need it to show diff
+			// Handle through confirmation modal
+			await syncWithDeployed()
+
+			confirmCallback = async () => {
+				open = false
+				await updateApp(npath)
+			}
+			// Open confirmation modal
+			open = true
+		}
+	}
+
+	async function syncWithDeployed() {
+		const deployedApp = await AppService.getAppByPath({
+			workspace: $workspaceStore!,
+			path: appPath,
+			withStarredInfo: true
+		})
+
+		deployedBy = deployedApp.created_by
+
+		// Strip off extra information
+		deployedValue = {
+			...deployedApp,
+			starred: undefined,
+			id: undefined,
+			created_at: undefined,
+			created_by: undefined,
+			versions: undefined,
+			extra_perms: undefined //
 		}
 	}
 
@@ -565,12 +627,18 @@
 		if (version === undefined) {
 			return
 		}
-		const appHistory = await AppService.getAppHistoryByPath({
-			workspace: $workspaceStore!,
-			path: appPath
-		})
-		onLatest = version === appHistory[0]?.version
+		try {
+			const appVersion = await AppService.getAppLatestVersion({
+				workspace: $workspaceStore!,
+				path: appPath
+			})
+			onLatest = version === appVersion?.version
+		} catch (e) {
+			console.error('Error comparing versions', e)
+			onLatest = true
+		}
 	}
+
 	$: saveDrawerOpen && compareVersions()
 
 	let selectedJobId: string | undefined = undefined
@@ -694,14 +762,18 @@
 		{
 			displayName: 'Diff',
 			icon: DiffIcon,
-			action: () => {
+			action: async () => {
 				if (!savedApp) {
 					return
 				}
+
+				// deployedValue should be syncronized when we open Diff
+				await syncWithDeployed()
+
 				diffDrawer?.openDrawer()
 				diffDrawer?.setDiff({
 					mode: 'normal',
-					deployed: savedApp,
+					deployed: deployedValue ?? savedApp,
 					draft: savedApp.draft,
 					current: {
 						summary: $summary,
@@ -736,6 +808,8 @@
 	export function openTroubleshootPanel() {
 		debugAppDrawerOpen = true
 	}
+
+	const dispatch = createEventDispatcher()
 </script>
 
 <svelte:window on:keydown={onKeyDown} />
@@ -745,6 +819,20 @@
 	{diffDrawer}
 	savedValue={savedApp}
 	modifiedValue={{
+		summary: $summary,
+		value: $app,
+		path: newPath || savedApp?.draft?.path || savedApp?.path,
+		policy
+	}}
+/>
+
+<DeployOverrideConfirmationModal
+	bind:deployedBy
+	bind:confirmCallback
+	bind:open
+	{diffDrawer}
+	bind:deployedValue
+	currentValue={{
 		summary: $summary,
 		value: $app,
 		path: newPath || savedApp?.draft?.path || savedApp?.path,
@@ -809,8 +897,8 @@
 <Drawer bind:open={saveDrawerOpen} size="800px">
 	<DrawerContent title="Deploy" on:close={() => closeSaveDrawer()}>
 		{#if !onLatest}
-			<Alert title="You're not on the latest app version" type="warning">
-				By deploying, you may overwrite changes made by other users.
+			<Alert title="You're not on the latest app version. " type="warning">
+				By deploying, you may overwrite changes made by other users. Press 'Deploy' to see diff.
 			</Alert>
 			<div class="py-2" />
 		{/if}
@@ -866,15 +954,18 @@
 				variant="border"
 				color="light"
 				disabled={!savedApp || savedApp.draft_only}
-				on:click={() => {
+				on:click={async () => {
 					if (!savedApp) {
 						return
 					}
+					// deployedValue should be syncronized when we open Diff
+					await syncWithDeployed()
+
 					saveDrawerOpen = false
 					diffDrawer?.openDrawer()
 					diffDrawer?.setDiff({
 						mode: 'normal',
-						deployed: savedApp,
+						deployed: deployedValue ?? savedApp,
 						draft: savedApp.draft,
 						current: {
 							summary: $summary,
@@ -888,7 +979,7 @@
 								if (appPath == '') {
 									createApp(newPath)
 								} else {
-									updateApp(newPath)
+									handleUpdateApp(newPath)
 								}
 							}
 						}
@@ -907,7 +998,7 @@
 					if (appPath == '') {
 						createApp(newPath)
 					} else {
-						updateApp(newPath)
+						handleUpdateApp(newPath)
 					}
 				}}
 			>
@@ -934,23 +1025,25 @@
 
 			<div class="mt-10" />
 
-			<h2>Secret public URL</h2>
+			<h2>Public URL</h2>
 			<div class="mt-4" />
 
-			<Toggle
-				options={{
-					left: `Require login and read-access`,
-					right: `No login required`
-				}}
-				checked={policy.execution_mode == 'anonymous'}
-				on:change={(e) => {
-					policy.execution_mode = e.detail ? 'anonymous' : 'publisher'
-					setPublishState()
-				}}
-			/>
+			<div class="flex gap-2 items-center">
+				<Toggle
+					options={{
+						left: `Require login and read-access`,
+						right: `No login required`
+					}}
+					checked={policy.execution_mode == 'anonymous'}
+					on:change={(e) => {
+						policy.execution_mode = e.detail ? 'anonymous' : 'publisher'
+						setPublishState()
+					}}
+				/>
+			</div>
 
 			<div class="my-6 box">
-				Secret public url:
+				Public url:
 				{#if secretUrl}
 					{@const url = `${$page.url.hostname}/public/${$workspaceStore}/${secretUrl}`}
 					{@const href = $page.url.protocol + '//' + url}
@@ -970,13 +1063,18 @@
 				{:else}<Loader2 class="animate-spin" />
 				{/if}
 				<div class="text-xs text-secondary"
-					>You may share this url directly or embed it using an iframe (if not requiring login)</div
+					>Share this url directly or embed it using an iframe (if requiring login, top-level domain
+					of embedding app must be the same as the one of Windmill)</div
 				>
 			</div>
-
 			<Alert type="info" title="Only latest deployed app is publicly available">
 				You will still need to deploy the app to make visible the latest changes
 			</Alert>
+
+			<a
+				href="https://www.windmill.dev/docs/advanced/external_auth_with_jwt#embed-public-apps-using-your-own-authentification"
+				class="mt-4 text-2xs">Embed this app in your own product to be used by your own users</a
+			>
 		{/if}
 	</DrawerContent>
 </Drawer>
@@ -1124,7 +1222,11 @@
 										{/if}
 										{#if job?.args}
 											<div class="p-2">
-												<JobArgs args={job?.args} />
+												<JobArgs
+													id={job.id}
+													workspace={job.workspace_id ?? $workspaceStore ?? 'no_w'}
+													args={job?.args}
+												/>
 											</div>
 										{/if}
 										{#if job?.raw_code}
@@ -1141,14 +1243,14 @@
 														duration={job?.['duration_ms']}
 														jobId={job?.id}
 														content={job?.logs}
-														isLoading={testIsLoading}
+														isLoading={testIsLoading && job?.['running'] == false}
 														tag={job?.tag}
 													/>
 												</Pane>
 												<Pane size={50} minSize={10} class="text-sm text-secondary">
-													{#if job != undefined && 'result' in job && job.result != undefined}
-														<div class="relative h-full px-2">
-															<DisplayResult
+													{#if job != undefined && 'result' in job && job.result != undefined}<div
+															class="relative h-full px-2"
+															><DisplayResult
 																workspaceId={$workspaceStore}
 																jobId={selectedJobId}
 																result={job.result}
@@ -1247,15 +1349,7 @@
 	class="border-b flex flex-row justify-between py-1 gap-2 gap-y-2 px-2 items-center overflow-y-visible overflow-x-auto"
 >
 	<div class="flex flex-row gap-2 items-center">
-		<div class="min-w-64 w-64">
-			<input
-				type="text"
-				placeholder="App summary"
-				class="text-sm w-full font-semibold"
-				bind:value={$summary}
-				on:keydown|stopPropagation
-			/>
-		</div>
+		<Summary bind:value={$summary} />
 		<div class="flex gap-2">
 			<UndoRedo
 				undoProps={{ disabled: $history?.index === 0 }}
@@ -1284,25 +1378,71 @@
 					/>
 				</ToggleButtonGroup>
 			{/if}
-			<div>
+			<div class="flex flex-row gap-2">
 				<ToggleButtonGroup class="h-[30px]" bind:selected={$breakpoint}>
-					<ToggleButton
-						tooltip="Mobile View"
-						icon={Smartphone}
-						value="sm"
-						iconProps={{ size: 16 }}
-					/>
 					<ToggleButton
 						tooltip="Computer View"
 						icon={Laptop2}
-						value="lg"
+						value={'lg'}
 						iconProps={{ size: 16 }}
 					/>
+					<ToggleButton
+						tooltip="Mobile View"
+						icon={Smartphone}
+						value={'sm'}
+						iconProps={{ size: 16 }}
+					/>
+					{#if $breakpoint === 'sm'}
+						<ToggleEnable
+							tooltip="Desktop view is enabled by default. Enable this to customize the layout of the components for the mobile view"
+							label="Enable mobile view for smaller screens"
+							bind:checked={$app.mobileViewOnSmallerScreens}
+							iconProps={{ size: 16 }}
+							iconOnly={false}
+						/>
+					{/if}
 				</ToggleButtonGroup>
 			</div>
 		</div>
 	</div>
 
+	{#if $mode !== 'preview'}
+		<div class="flex gap-1">
+			<HideButton
+				direction="left"
+				hidden={leftPanelHidden}
+				on:click={() => {
+					if (leftPanelHidden) {
+						dispatch('showLeftPanel')
+					} else {
+						dispatch('hideLeftPanel')
+					}
+				}}
+			/>
+			<HideButton
+				hidden={bottomPanelHidden}
+				direction="bottom"
+				on:click={() => {
+					if (bottomPanelHidden) {
+						dispatch('showBottomPanel')
+					} else {
+						dispatch('hideBottomPanel')
+					}
+				}}
+			/>
+			<HideButton
+				hidden={rightPanelHidden}
+				direction="right"
+				on:click={() => {
+					if (rightPanelHidden) {
+						dispatch('showRightPanel')
+					} else {
+						dispatch('hideRightPanel')
+					}
+				}}
+			/>
+		</div>
+	{/if}
 	{#if $enterpriseLicense && appPath != ''}
 		<Awareness />
 	{/if}

@@ -14,6 +14,7 @@ use sqlx::{query_scalar, Postgres, Transaction};
 use std::collections::HashMap;
 use std::str::FromStr;
 use windmill_common::db::Authed;
+use windmill_common::ee::LICENSE_KEY_VALID;
 use windmill_common::flows::Retry;
 use windmill_common::jobs::JobPayload;
 use windmill_common::schedule::schedule_to_user;
@@ -31,6 +32,13 @@ pub async fn push_scheduled_job<'c, R: rsmq_async::RsmqConnection + Send + 'c>(
     schedule: &Schedule,
     authed: Option<&Authed>,
 ) -> Result<QueueTransaction<'c, R>> {
+    if !*LICENSE_KEY_VALID.read().await {
+        return Err(error::Error::BadRequest(
+            "License key is not valid. Go to your superadmin settings to update your license key."
+                .to_string(),
+        ));
+    }
+
     let sched = cron::Schedule::from_str(schedule.schedule.as_ref())
         .map_err(|e| error::Error::BadRequest(e.to_string()))?;
 
@@ -112,7 +120,11 @@ pub async fn push_scheduled_job<'c, R: rsmq_async::RsmqConnection + Send + 'c>(
             .map(|x| (x.tag, x.dedicated_worker))
             .unwrap_or_else(|| (None, None));
         (
-            JobPayload::Flow { path: schedule.script_path.clone(), dedicated_worker },
+            JobPayload::Flow {
+                path: schedule.script_path.clone(),
+                dedicated_worker,
+                apply_preprocessor: false,
+            },
             tag,
             None,
         )
@@ -154,14 +166,18 @@ pub async fn push_scheduled_job<'c, R: rsmq_async::RsmqConnection + Send + 'c>(
                     hash: hash,
                     retry: parsed_retry,
                     args: static_args,
-                    custom_concurrency_key,
-                    concurrent_limit: concurrent_limit,
-                    concurrency_time_window_s: concurrency_time_window_s,
+                    custom_concurrency_key: None,
+                    concurrent_limit: None,
+                    concurrency_time_window_s: None,
                     cache_ttl: cache_ttl,
                     priority: priority,
                     tag_override: schedule.tag.clone(),
                 },
-                Some("flow".to_string()),
+                if schedule.tag.as_ref().is_some_and(|x| x != "") {
+                    schedule.tag.clone()
+                } else {
+                    tag
+                },
                 timeout,
             )
         } else {
@@ -176,6 +192,7 @@ pub async fn push_scheduled_job<'c, R: rsmq_async::RsmqConnection + Send + 'c>(
                     dedicated_worker,
                     language,
                     priority,
+                    apply_preprocessor: false,
                 },
                 if schedule.tag.as_ref().is_some_and(|x| x != "") {
                     schedule.tag.clone()
@@ -208,7 +225,7 @@ pub async fn push_scheduled_job<'c, R: rsmq_async::RsmqConnection + Send + 'c>(
         tx,
         &schedule.workspace_id,
         payload,
-        crate::PushArgs { args, extra: HashMap::new() },
+        crate::PushArgs { args: &args, extra: None },
         &schedule_to_user(&schedule.path),
         &schedule.email,
         username_to_permissioned_as(&schedule.edited_by),
@@ -228,6 +245,7 @@ pub async fn push_scheduled_job<'c, R: rsmq_async::RsmqConnection + Send + 'c>(
         authed,
     )
     .await?;
+
     Ok(tx) // TODO: Bubble up pushed UUID from here
 }
 

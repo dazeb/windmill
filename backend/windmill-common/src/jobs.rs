@@ -1,20 +1,25 @@
 use std::collections::HashMap;
 
+use bytes::Bytes;
+use futures_core::Stream;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sqlx::{types::Json, Pool, Postgres, Transaction};
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 pub const ENTRYPOINT_OVERRIDE: &str = "_ENTRYPOINT_OVERRIDE";
 
+pub const PREPROCESSOR_FAKE_ENTRYPOINT: &str = "__WM_PREPROCESSOR";
+
 use crate::{
-    error::{self, Error},
+    error::{self, to_anyhow, Error},
     flow_status::{FlowStatus, RestartedFrom},
     flows::{FlowValue, Retry},
     get_latest_deployed_hash_for_path,
     scripts::{ScriptHash, ScriptLang},
-    worker::to_raw_value,
+    worker::{to_raw_value, TMP_DIR},
 };
 
 #[derive(sqlx::Type, Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -113,14 +118,6 @@ pub struct QueuedJob {
 }
 
 impl QueuedJob {
-    pub fn get_args(&self) -> HashMap<String, Box<RawValue>> {
-        if let Some(args) = self.args.as_ref() {
-            args.0.clone()
-        } else {
-            HashMap::new()
-        }
-    }
-
     pub fn script_path(&self) -> &str {
         self.script_path
             .as_ref()
@@ -287,8 +284,8 @@ impl CompletedJob {
 }
 
 #[derive(sqlx::FromRow)]
-pub struct BranchResults<'a> {
-    pub result: &'a RawValue,
+pub struct BranchResults {
+    pub result: sqlx::types::Json<Box<RawValue>>,
     pub id: Uuid,
 }
 
@@ -307,6 +304,7 @@ pub enum JobPayload {
         dedicated_worker: Option<bool>,
         language: ScriptLang,
         priority: Option<i16>,
+        apply_preprocessor: bool,
     },
     Code(RawCode),
     Dependencies {
@@ -318,6 +316,7 @@ pub enum JobPayload {
     FlowDependencies {
         path: String,
         dedicated_worker: Option<bool>,
+        version: i64,
     },
     AppDependencies {
         path: String,
@@ -335,6 +334,7 @@ pub enum JobPayload {
     Flow {
         path: String,
         dedicated_worker: Option<bool>,
+        apply_preprocessor: bool,
     },
     RestartedFlow {
         completed_job_id: Uuid,
@@ -383,10 +383,11 @@ type Tag = String;
 
 pub type DB = Pool<Postgres>;
 
-pub async fn script_path_to_payload(
+pub async fn script_path_to_payload<'e, E: sqlx::Executor<'e, Database = Postgres>>(
     script_path: &str,
-    db: &DB,
+    db: E,
     w_id: &str,
+    skip_preprocessor: Option<bool>,
 ) -> error::Result<(JobPayload, Option<Tag>, Option<bool>, Option<i32>)> {
     let (job_payload, tag, delete_after_use, script_timeout) = if script_path.starts_with("hub/") {
         (
@@ -408,6 +409,7 @@ pub async fn script_path_to_payload(
             priority,
             delete_after_use,
             script_timeout,
+            has_preprocessor,
         ) = get_latest_deployed_hash_for_path(db, w_id, script_path).await?;
         (
             JobPayload::ScriptHash {
@@ -420,6 +422,8 @@ pub async fn script_path_to_payload(
                 language,
                 dedicated_worker,
                 priority,
+                apply_preprocessor: !skip_preprocessor.unwrap_or(false)
+                    && has_preprocessor.unwrap_or(false),
             },
             tag,
             delete_after_use,
@@ -471,13 +475,13 @@ pub async fn script_hash_to_tag_and_limits<'c>(
     ))
 }
 
-pub async fn get_payload_tag_from_prefixed_path(
+pub async fn get_payload_tag_from_prefixed_path<'e, E: sqlx::Executor<'e, Database = Postgres>>(
     path: &str,
-    db: &DB,
+    db: E,
     w_id: &str,
 ) -> Result<(JobPayload, Option<String>), Error> {
     let (payload, tag, _, _) = if path.starts_with("script/") {
-        script_path_to_payload(path.strip_prefix("script/").unwrap(), &db, w_id).await?
+        script_path_to_payload(path.strip_prefix("script/").unwrap(), db, w_id, Some(true)).await?
     } else if path.starts_with("flow/") {
         let path = path.strip_prefix("flow/").unwrap().to_string();
         let r = sqlx::query!(
@@ -490,7 +494,12 @@ pub async fn get_payload_tag_from_prefixed_path(
         let (tag, dedicated_worker) = r
             .map(|x| (x.tag, x.dedicated_worker))
             .unwrap_or_else(|| (None, None));
-        (JobPayload::Flow { path, dedicated_worker }, tag, None, None)
+        (
+            JobPayload::Flow { path, dedicated_worker, apply_preprocessor: false },
+            tag,
+            None,
+            None,
+        )
     } else {
         return Err(Error::BadRequest(format!(
             "path must start with script/ or flow/ (got {})",
@@ -586,4 +595,74 @@ pub fn format_completed_job_result(mut cj: CompletedJob) -> CompletedJobWithForm
     );
     cj.result = None; // very important to avoid sending the result twice
     CompletedJobWithFormattedResult { cj, result: Some(sql_result) }
+}
+
+pub async fn get_logs_from_disk(
+    log_offset: i32,
+    logs: &str,
+    log_file_index: &Option<Vec<String>>,
+) -> Option<impl Stream<Item = Result<Bytes, anyhow::Error>>> {
+    if log_offset > 0 {
+        if let Some(file_index) = log_file_index.clone() {
+            for file_p in &file_index {
+                if !tokio::fs::metadata(format!("{TMP_DIR}/{file_p}"))
+                    .await
+                    .is_ok()
+                {
+                    return None;
+                }
+            }
+
+            let logs = logs.to_string();
+            let stream = async_stream::stream! {
+                for file_p in file_index.clone() {
+                    let mut file = tokio::fs::File::open(format!("{TMP_DIR}/{file_p}")).await.map_err(to_anyhow)?;
+                    let mut buffer = Vec::new();
+                    file.read_to_end(&mut buffer).await.map_err(to_anyhow)?;
+                    yield Ok(bytes::Bytes::from(buffer)) as anyhow::Result<bytes::Bytes>;
+                }
+
+                yield Ok(bytes::Bytes::from(logs))
+            };
+            return Some(stream);
+        }
+    }
+    return None;
+}
+
+#[cfg(all(feature = "enterprise", feature = "parquet"))]
+pub async fn get_logs_from_store(
+    log_offset: i32,
+    logs: &str,
+    log_file_index: &Option<Vec<String>>,
+) -> Option<impl Stream<Item = Result<Bytes, object_store::Error>>> {
+    use crate::s3_helpers::OBJECT_STORE_CACHE_SETTINGS;
+
+    if log_offset > 0 {
+        if let Some(file_index) = log_file_index.clone() {
+            if let Some(os) = OBJECT_STORE_CACHE_SETTINGS.read().await.clone() {
+
+                let logs = logs.to_string();
+                let stream = async_stream::stream! {
+                    for file_p in file_index.clone() {
+                        let file_p_2 = file_p.clone();
+                        let file = os.get(&object_store::path::Path::from(file_p)).await;
+                        if let Ok(file) = file {
+                            if let Ok(bytes) = file.bytes().await {
+                                yield Ok(bytes::Bytes::from(bytes)) as object_store::Result<bytes::Bytes>;
+                            }
+                        } else {
+                            tracing::debug!("error getting file from store: {file_p_2}: {}", file.err().unwrap());
+                        }
+                    }
+
+                    yield Ok(bytes::Bytes::from(logs))
+                };
+                return Some(stream);
+            } else {
+                tracing::debug!("object store client not present, cannot stream logs from store");
+            }
+        }
+    }
+    return None;
 }

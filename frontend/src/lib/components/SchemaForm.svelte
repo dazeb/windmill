@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Schema } from '$lib/common'
-	import { VariableService } from '$lib/gen'
+	import { VariableService, type Script } from '$lib/gen'
 	import { workspaceStore } from '$lib/stores'
 	import { allTrue, computeShow } from '$lib/utils'
 	import { Button } from './common'
@@ -15,7 +15,6 @@
 	import LightweightArgInput from './LightweightArgInput.svelte'
 	import { deepEqual } from 'fast-equals'
 	import { dragHandleZone, type Options as DndOptions } from '@windmill-labs/svelte-dnd-action'
-	import { flip } from 'svelte/animate'
 
 	export let schema: Schema | any
 	export let schemaSkippedValues: string[] = []
@@ -42,6 +41,10 @@
 	export let lightweightMode: boolean = false
 	export let dndConfig: DndOptions | undefined = undefined
 	export let items: { id: string; value: string }[] | undefined = undefined
+	export let helperScript:
+		| { type: 'inline'; path?: string; lang: Script['language']; code: string }
+		| { type: 'hash'; hash: string }
+		| undefined = undefined
 
 	const dispatch = createEventDispatcher()
 
@@ -98,7 +101,6 @@
 	}
 
 	function reorder() {
-		dispatch('change')
 		let lkeys = Object.keys(schema?.properties ?? {})
 		if (!deepEqual(schema?.order, lkeys) || !deepEqual(keys, lkeys)) {
 			if (schema?.order && Array.isArray(schema.order)) {
@@ -117,7 +119,12 @@
 					})
 				schema.properties = n
 			}
-			keys = Object.keys(schema.properties ?? {})
+			let nkeys = Object.keys(schema.properties ?? {})
+
+			if (!deepEqual(keys, nkeys)) {
+				keys = nkeys
+				dispatch('change')
+			}
 		}
 
 		if (!noDelete && hasExtraKeys()) {
@@ -145,7 +152,7 @@
 	{#if keys.length > 0}
 		{#each fields as item, i (item.id)}
 			{@const argName = item.value}
-			<div animate:flip={{ duration: 200 }}>
+			<div>
 				<!-- svelte-ignore a11y-click-events-have-key-events -->
 				{#if !schemaSkippedValues.includes(argName) && Object.keys(schema?.properties ?? {}).includes(argName)}
 					<!-- svelte-ignore a11y-no-static-element-interactions -->
@@ -178,6 +185,9 @@
 										extra={schema.properties[argName]}
 										title={schema.properties[argName].title}
 										placeholder={schema.properties[argName].placeholder}
+										disabled={disabledArgs.includes(argName) ||
+											disabled ||
+											schema.properties[argName].disabled}
 									>
 										<svelte:fragment slot="actions">
 											<slot name="actions" />
@@ -234,7 +244,9 @@
 										bind:order={schema.properties[argName].order}
 										nestedRequired={schema.properties[argName]?.required}
 										itemsType={schema.properties[argName].items}
-										disabled={disabledArgs.includes(argName) || disabled}
+										disabled={disabledArgs.includes(argName) ||
+											disabled ||
+											schema.properties[argName].disabled}
 										{compact}
 										{variableEditor}
 										{itemPicker}
@@ -248,6 +260,8 @@
 										title={schema.properties[argName].title}
 										placeholder={schema.properties[argName].placeholder}
 										orderEditable={dndConfig != undefined}
+										otherArgs={args}
+										{helperScript}
 									>
 										<svelte:fragment slot="actions">
 											<slot name="actions" />

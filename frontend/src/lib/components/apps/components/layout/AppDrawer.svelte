@@ -2,7 +2,8 @@
 	import { getContext } from 'svelte'
 	import SubGridEditor from '../../editor/SubGridEditor.svelte'
 	import type { AppViewerContext, ComponentCustomCSS, RichConfigurations } from '../../types'
-	import Portal from 'svelte-portal'
+	import Portal from '$lib/components/Portal.svelte'
+
 	import { initCss } from '../../utils'
 	import { Button, Drawer, DrawerContent } from '$lib/components/common'
 	import { twMerge } from 'tailwind-merge'
@@ -112,7 +113,7 @@
 	</AlignWrapper>
 </div>
 
-<Portal target="#app-editor-top-level-drawer">
+<Portal target="#app-editor-top-level-drawer" name="app-drawer">
 	<Drawer
 		let:open
 		bind:this={appDrawer}

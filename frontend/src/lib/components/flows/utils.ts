@@ -16,6 +16,8 @@ import type { PickableProperties } from './previousResults'
 import { NEVER_TESTED_THIS_FAR } from './models'
 import { sendUserToast } from '$lib/toast'
 import type { Schema } from '$lib/common'
+import { parseOutputs } from '$lib/infer'
+import type { ExtendedOpenFlow } from './types'
 
 function create_context_function_template(eval_string: string, context: Record<string, any>) {
 	return `
@@ -68,6 +70,28 @@ export function evalValue(
 		return undefined
 	}
 	return v
+}
+
+export function filteredContentForExport(flow: ExtendedOpenFlow) {
+	let o = {
+		summary: flow.summary,
+		description: flow.description,
+		value: flow.value,
+		schema: flow.schema
+	}
+	if (flow.dedicated_worker) {
+		o['dedicated_worker'] = flow.dedicated_worker
+	}
+	if (flow.visible_to_runner_only) {
+		o['visible_to_runner_only'] = flow.visible_to_runner_only
+	}
+	if (flow.ws_error_handler_muted) {
+		o['ws_error_handler_muted'] = flow.ws_error_handler_muted
+	}
+	if (flow.tag) {
+		o['tag'] = flow.tag
+	}
+	return o
 }
 
 export function cleanInputs(flow: OpenFlow | any): OpenFlow & {
@@ -163,7 +187,7 @@ export function emptyFlowModuleState(): FlowModuleState {
 export function isInputFilled(
 	inputTransforms: Record<string, InputTransform>,
 	key: string,
-	schema: Schema
+	schema: Schema | undefined
 ): boolean {
 	const required = schema?.required?.includes(key) ?? false
 
@@ -189,34 +213,102 @@ export function isInputFilled(
 	return true
 }
 
-export function setRequiredInputFilled(
+async function isConnectedToMissingModule(
 	argName: string,
 	flowModuleValue: FlowModuleValue,
-	requiredInputsFilled: Record<string, boolean>,
-	schema: Schema
-) {
-	const type = flowModuleValue.type
-	if (type == 'rawscript' || type == 'script' || type == 'flow') {
-		requiredInputsFilled[argName] = isInputFilled(
-			flowModuleValue.input_transforms,
-			argName,
-			schema ?? {}
-		)
-	}
-
-	return requiredInputsFilled
-}
-
-export function initRequiredInputFilled(flowModuleValue: FlowModuleValue, schema: Schema) {
-	const requiredInputsFilled: Record<string, boolean> = {}
+	moduleIds: string[]
+): Promise<string | undefined> {
 	const type = flowModuleValue.type
 
-	if (type == 'rawscript' || type == 'script' || type == 'flow') {
-		const keys = Object.keys(flowModuleValue.input_transforms)
-		for (const key of keys) {
-			requiredInputsFilled[key] = isInputFilled(flowModuleValue.input_transforms, key, schema ?? {})
+	if (type === 'rawscript' || type === 'script' || type === 'flow') {
+		const input = flowModuleValue?.input_transforms[argName]
+		const val: string = input.type === 'static' ? String(input.value) : input.expr
+
+		try {
+			const outputs = await parseOutputs(val, true)
+			let error: string = ''
+
+			outputs?.forEach(([componentId, id]) => {
+				if (componentId === 'results') {
+					if (!moduleIds.includes(id)) {
+						error += `Input ${argName} is connected to a missing module with id ${id}\n`
+					}
+				}
+			})
+
+			return error
+		} catch (e) {
+			return `Input ${argName} expression is invalid`
 		}
 	}
 
-	return requiredInputsFilled
+	return
+}
+
+export async function computeFlowStepWarning(
+	argName: string,
+	flowModuleValue: FlowModuleValue,
+	messages: Record<
+		string,
+		{
+			message: string
+			type: 'error' | 'warning'
+		}
+	>,
+	schema: Schema | undefined,
+	moduleIds: string[] = []
+) {
+	if (messages[argName]) {
+		delete messages[argName]
+	}
+
+	const type = flowModuleValue.type
+	if (type == 'rawscript' || type == 'script' || type == 'flow') {
+		if (!isInputFilled(flowModuleValue.input_transforms, argName, schema)) {
+			messages[argName] = {
+				message: `Input ${argName} is required but not filled`,
+				type: 'warning'
+			}
+		}
+
+		const errorMessage = await isConnectedToMissingModule(argName, flowModuleValue, moduleIds)
+
+		if (errorMessage) {
+			messages[argName] = {
+				message: errorMessage,
+				type: 'error'
+			}
+		} else {
+			if (messages[argName]?.type === 'error') {
+				delete messages[argName]
+			}
+		}
+	}
+
+	return messages
+}
+
+export async function initFlowStepWarnings(
+	flowModuleValue: FlowModuleValue,
+	schema: Schema | undefined,
+	moduleIds: string[] = []
+) {
+	const messages: Record<
+		string,
+		{
+			message: string
+			type: 'error' | 'warning'
+		}
+	> = {}
+	const type = flowModuleValue.type
+
+	if (type == 'rawscript' || type == 'script' || type == 'flow') {
+		const keys = Object.keys(flowModuleValue.input_transforms ?? {})
+		const promises = keys.map(async (key) => {
+			await computeFlowStepWarning(key, flowModuleValue, messages, schema, moduleIds)
+		})
+		await Promise.all(promises)
+	}
+
+	return messages
 }

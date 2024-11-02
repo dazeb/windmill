@@ -36,6 +36,9 @@
 	import ToggleButtonGroup from '$lib/components/common/toggleButton-v2/ToggleButtonGroup.svelte'
 	import ToggleButton from '$lib/components/common/toggleButton-v2/ToggleButton.svelte'
 	import DropdownV2 from '$lib/components/DropdownV2.svelte'
+	import { goto } from '$app/navigation'
+	import { base } from '$app/paths'
+	import { isJobCancelable } from '$lib/utils'
 
 	let jobs: Job[] | undefined
 	let selectedIds: string[] = []
@@ -48,10 +51,14 @@
 	let folder: string | null = $page.url.searchParams.get('folder')
 	let label: string | null = $page.url.searchParams.get('label')
 	let concurrencyKey: string | null = $page.url.searchParams.get('concurrency_key')
+	let tag: string | null = $page.url.searchParams.get('tag')
 	// Rest of filters handled by RunsFilter
-	let success: 'running' | 'success' | 'failure' | undefined = ($page.url.searchParams.get(
-		'success'
-	) ?? undefined) as 'running' | 'success' | 'failure' | undefined
+	let success: 'running' | 'suspended' | 'waiting' | 'success' | 'failure' | undefined =
+		($page.url.searchParams.get('success') ?? undefined) as
+			| 'running'
+			| 'success'
+			| 'failure'
+			| undefined
 	let isSkipped: boolean | undefined =
 		$page.url.searchParams.get('is_skipped') != undefined
 			? $page.url.searchParams.get('is_skipped') == 'true'
@@ -83,8 +90,57 @@
 	let schedulePath = $page.url.searchParams.get('schedule_path') ?? undefined
 	let jobKindsCat = $page.url.searchParams.get('job_kinds') ?? 'runs'
 	let allWorkspaces = $page.url.searchParams.get('all_workspaces') == 'true' ?? false
+	let lastFetchWentToEnd = false
+
+	function loadFromQuery() {
+		path = $page.params.path
+		user = $page.url.searchParams.get('user')
+		folder = $page.url.searchParams.get('folder')
+		label = $page.url.searchParams.get('label')
+		concurrencyKey = $page.url.searchParams.get('concurrency_key')
+		tag = $page.url.searchParams.get('tag')
+		// Rest of filters handled by RunsFilter
+		success = ($page.url.searchParams.get('success') ?? undefined) as
+			| 'running'
+			| 'success'
+			| 'failure'
+			| undefined
+		isSkipped =
+			$page.url.searchParams.get('is_skipped') != undefined
+				? $page.url.searchParams.get('is_skipped') == 'true'
+				: false
+
+		showSchedules =
+			$page.url.searchParams.get('show_schedules') != undefined
+				? $page.url.searchParams.get('show_schedules') == 'true'
+				: localStorage.getItem('show_schedules_in_run') == 'false'
+				? false
+				: true
+		showFutureJobs =
+			$page.url.searchParams.get('show_future_jobs') != undefined
+				? $page.url.searchParams.get('show_future_jobs') == 'true'
+				: localStorage.getItem('show_future_jobs') == 'false'
+				? false
+				: true
+
+		argFilter = $page.url.searchParams.get('arg')
+			? JSON.parse(decodeURIComponent($page.url.searchParams.get('arg') ?? '{}'))
+			: undefined
+		resultFilter = $page.url.searchParams.get('result')
+			? JSON.parse(decodeURIComponent($page.url.searchParams.get('result') ?? '{}'))
+			: undefined
+
+		// Handled on the main page
+		minTs = $page.url.searchParams.get('min_ts') ?? undefined
+		maxTs = $page.url.searchParams.get('max_ts') ?? undefined
+		schedulePath = $page.url.searchParams.get('schedule_path') ?? undefined
+		jobKindsCat = $page.url.searchParams.get('job_kinds') ?? 'runs'
+		allWorkspaces = $page.url.searchParams.get('all_workspaces') == 'true' ?? false
+	}
 
 	let queue_count: Tweened<number> | undefined = undefined
+	let suspended_count: Tweened<number> | undefined = undefined
+
 	let jobKinds: string | undefined = undefined
 	let loading: boolean = false
 	let paths: string[] = []
@@ -111,6 +167,8 @@
 
 	let manualDatePicker: ManuelDatePicker
 
+	let runsTable: RunsTable
+
 	$: (user ||
 		label ||
 		folder ||
@@ -124,14 +182,16 @@
 		schedulePath ||
 		jobKindsCat ||
 		concurrencyKey ||
+		tag ||
 		graph ||
-		minTs ||
 		maxTs ||
 		allWorkspaces ||
 		$workspaceStore) &&
-		setQuery()
+		setQuery(false)
 
-	function setQuery() {
+	$: minTs || setQuery(true)
+
+	function setQuery(replaceState: boolean) {
 		let searchParams = new URLSearchParams()
 
 		if (user) {
@@ -217,6 +277,12 @@
 			searchParams.delete('concurrency_key')
 		}
 
+		if (tag) {
+			searchParams.set('tag', tag)
+		} else {
+			searchParams.delete('tag')
+		}
+
 		if (label) {
 			searchParams.set('label', label)
 		} else {
@@ -229,9 +295,16 @@
 			searchParams.delete('graph')
 		}
 
-		let newPath = path ? `/${path}` : '/'
-		let newUrl = `/runs${newPath}?${searchParams.toString()}`
-		history.replaceState(history.state, '', newUrl.toString())
+		let newPath = path ? `/${path}` : ''
+
+		let newUrl = `${base}/runs${newPath}?${searchParams.toString()}`
+		if (
+			$page.url.searchParams.toString() != searchParams.toString() ||
+			$page.url.pathname != newUrl.split('?')[0]
+		) {
+			// replaceState(newUrl.toString(), $page.state)
+			goto(newUrl.toString(), { replaceState: replaceState })
+		}
 	}
 
 	function reloadJobsWithoutFilterError() {
@@ -246,10 +319,9 @@
 	function reset() {
 		minTs = undefined
 		maxTs = undefined
-
-		autoRefresh = true
 		jobs = undefined
 		completedJobs = undefined
+		lastFetchWentToEnd = false
 		selectedManualDate = 0
 		selectedIds = []
 		jobIdsToCancel = []
@@ -286,6 +358,8 @@
 		folder = null
 		label = null
 		concurrencyKey = null
+		tag = null
+		schedulePath = undefined
 	}
 
 	function filterByUser(e: CustomEvent<string>) {
@@ -294,6 +368,8 @@
 		user = e.detail
 		label = null
 		concurrencyKey = null
+		tag = null
+		schedulePath = undefined
 	}
 
 	function filterByFolder(e: CustomEvent<string>) {
@@ -302,6 +378,8 @@
 		folder = e.detail
 		label = null
 		concurrencyKey = null
+		tag = null
+		schedulePath = undefined
 	}
 
 	function filterByLabel(e: CustomEvent<string>) {
@@ -310,6 +388,8 @@
 		folder = null
 		label = e.detail
 		concurrencyKey = null
+		tag = null
+		schedulePath = undefined
 	}
 
 	function filterByConcurrencyKey(e: CustomEvent<string>) {
@@ -318,6 +398,28 @@
 		folder = null
 		label = null
 		concurrencyKey = e.detail
+		tag = null
+		schedulePath = undefined
+	}
+
+	function filterByTag(e: CustomEvent<string>) {
+		path = null
+		user = null
+		folder = null
+		label = null
+		concurrencyKey = null
+		tag = e.detail
+		schedulePath = undefined
+	}
+
+	function filterBySchedule(e: CustomEvent<string>) {
+		path = null
+		user = null
+		folder = null
+		label = null
+		concurrencyKey = null
+		tag = null
+		schedulePath = e.detail
 	}
 
 	let calendarChangeTimeout: NodeJS.Timeout | undefined = undefined
@@ -358,17 +460,31 @@
 			scriptPathStart: folder === null || folder === '' ? undefined : `f/${folder}/`,
 			jobKinds,
 			success: success == 'success' ? true : success == 'failure' ? false : undefined,
-			running: success == 'running' ? true : undefined,
+			running:
+				success == 'running' || success == 'suspended'
+					? true
+					: success == 'waiting'
+					? false
+					: undefined,
+			isSkipped: isSkipped ? undefined : false,
+			// isFlowStep: jobKindsCat != 'all' ? false : undefined,
+			hasNullParent:
+				path != undefined || path != undefined || jobKindsCat != 'all' ? true : undefined,
+			label: label === null || label === '' ? undefined : label,
+			tag: tag === null || tag === '' ? undefined : tag,
 			isNotSchedule: showSchedules == false ? true : undefined,
-			scheduledForBeforeNow: showFutureJobs == false ? true : undefined,
+			suspended: success == 'waiting' ? false : success == 'suspended' ? true : undefined,
+			scheduledForBeforeNow:
+				showFutureJobs == false || success == 'waiting' || success == 'suspended'
+					? true
+					: undefined,
 			args:
 				argFilter && argFilter != '{}' && argFilter != '' && argError == '' ? argFilter : undefined,
 			result:
 				resultFilter && resultFilter != '{}' && resultFilter != '' && resultError == ''
 					? resultFilter
 					: undefined,
-			allWorkspaces: allWorkspaces ? true : undefined,
-			concurrencyKey: concurrencyKey ?? undefined
+			allWorkspaces: allWorkspaces ? true : undefined
 		}
 
 		selectedFiltersString = JSON.stringify(selectedFilters, null, 4)
@@ -381,10 +497,6 @@
 		isCancelingVisibleJobs = true
 	}
 
-	function isJobCancelable(j: Job): boolean {
-		return j.type === 'QueuedJob' && !j.schedule_path
-	}
-
 	function jobCountString(count: number) {
 		return `${count} ${count == 1 ? 'job' : 'jobs'}`
 	}
@@ -393,16 +505,38 @@
 		lookback = lookbackInDays
 	}
 
+	async function loadExtra() {
+		if (jobLoader) {
+			lastFetchWentToEnd = await jobLoader.loadExtraJobs()
+			console.log(lastFetchWentToEnd)
+		}
+	}
+
 	const warnJobLimitMsg =
-		'The exact number of concurrent job at the beginning of the time range may be incorrect as only the last 1000 jobs are taken into account: a job that was started earlier than this limit will not be taken into account'
+		'The exact number of concurrent jobs at the beginning of the time range may be incorrect as only the last 1000 jobs are taken into account: a job that was started earlier than this limit will not be taken into account'
 
 	$: warnJobLimit =
 		graph === 'ConcurrencyChart' &&
 		extendedJobs !== undefined &&
 		extendedJobs.jobs.length + extendedJobs.obscured_jobs.length >= 1000
 
+	function jobsFilter(f: 'waiting' | 'suspended') {
+		path = null
+		user = null
+		folder = null
+		label = null
+		concurrencyKey = null
+		schedulePath = undefined
+		path = null
+		tag = null
+		if (success == f) {
+			success = undefined
+		} else {
+			success = f
+		}
+		jobKindsCat = 'all'
+	}
 </script>
-
 
 <JobLoader
 	{allWorkspaces}
@@ -424,6 +558,7 @@
 	bind:maxTs
 	{jobKinds}
 	bind:queue_count
+	bind:suspended_count
 	{autoRefresh}
 	bind:completedJobs
 	bind:externalJobs
@@ -431,6 +566,7 @@
 	{concurrencyKey}
 	{argError}
 	{resultError}
+	{tag}
 	bind:loading
 	bind:this={jobLoader}
 	lookback={graphIsRunsChart ? 0 : lookback}
@@ -450,6 +586,7 @@
 		selectedIds = []
 		jobLoader?.loadJobs(minTs, maxTs, true, true)
 		sendUserToast(`Canceled ${uuids.length} jobs`)
+		isSelectingJobsToCancel = false
 	}}
 	loading={fetchingFilteredJobs}
 	on:canceled={() => {
@@ -473,6 +610,7 @@
 		selectedIds = []
 		jobLoader?.loadJobs(minTs, maxTs, true, true)
 		sendUserToast(`Canceled ${uuids.length} jobs`)
+		isSelectingJobsToCancel = false
 	}}
 	on:canceled={() => {
 		isCancelingVisibleJobs = false
@@ -491,9 +629,15 @@
 	</DrawerContent>
 </Drawer>
 
-<svelte:window bind:innerWidth />
+<svelte:window
+	bind:innerWidth
+	on:popstate={() => {
+		reset()
+		loadFromQuery()
+	}}
+/>
 
-{#if innerWidth > 1280}
+{#if innerWidth > 900}
 	<div class="w-full h-screen">
 		<div class="px-2">
 			<div class="flex items-center space-x-2 flex-row justify-between">
@@ -522,6 +666,7 @@
 					bind:folder
 					bind:label
 					bind:concurrencyKey
+					bind:tag
 					bind:path
 					bind:success
 					bind:argFilter
@@ -530,7 +675,13 @@
 					bind:resultError
 					bind:jobKindsCat
 					bind:allWorkspaces
+					bind:schedulePath
 					on:change={reloadJobsWithoutFilterError}
+					on:successChange={(e) => {
+						if (e.detail == 'running' && maxTs != undefined) {
+							maxTs = undefined
+						}
+					}}
 					{usernames}
 					{folders}
 					{paths}
@@ -597,16 +748,22 @@
 			</div>
 			{#if graph === 'RunChart'}
 				<RunChart
+					{lastFetchWentToEnd}
 					bind:selectedIds
 					canSelect={!isSelectingJobsToCancel}
 					minTimeSet={minTs}
 					maxTimeSet={maxTs}
 					maxIsNow={maxTs == undefined}
+					on:loadExtra={loadExtra}
 					jobs={completedJobs}
 					on:zoom={async (e) => {
 						minTs = e.detail.min.toISOString()
 						maxTs = e.detail.max.toISOString()
+						manualDatePicker?.resetChoice()
 						jobLoader?.loadJobs(minTs, maxTs, true)
+					}}
+					on:pointClicked={(e) => {
+						runsTable.scrollToRun(e.detail)
 					}}
 				/>
 			{:else if graph === 'ConcurrencyChart'}
@@ -625,7 +782,17 @@
 		</div>
 		<div class="flex flex-col gap-1 md:flex-row w-full p-4">
 			<div class="flex gap-2 grow flex-row">
-				<RunsQueue {queue_count} {allWorkspaces} />
+				<RunsQueue
+					{success}
+					{queue_count}
+					{suspended_count}
+					on:jobs_waiting={() => {
+						jobsFilter('waiting')
+					}}
+					on:jobs_suspended={() => {
+						jobsFilter('suspended')
+					}}
+				/>
 				<div class="flex flex-row">
 					{#if isSelectingJobsToCancel}
 						<div class="mt-1 p-2 h-8 flex flex-row items-center gap-1">
@@ -698,7 +865,9 @@
 						localStorage.setItem('show_schedules_in_run', showSchedules ? 'true' : 'false')
 					}}
 				/>
-				<span class="text-xs absolute -top-4">CRON Schedules</span>
+				<span class="text-xs absolute -top-4"
+					><span class="hidden xl:inline">CRON</span> Schedules</span
+				>
 
 				<Calendar size={16} />
 			</div>
@@ -727,6 +896,7 @@
 						/>
 
 						<CalendarPicker
+							clearable={true}
 							date={minTs}
 							label="Min datetimes"
 							on:change={async ({ detail }) => {
@@ -748,13 +918,14 @@
 				</div>
 				<div class="relative w-full">
 					<div class="flex gap-1 relative w-full">
-						<span class="text-xs absolute -top-4">Max datetime</span>
+						<span class="text-xs absolute -top-4">Max</span>
 						<input
 							type="text"
 							value={maxTs ? new Date(maxTs).toLocaleString() : 'zoom x axis to set max'}
 							disabled
 						/>
 						<CalendarPicker
+							clearable={true}
 							date={maxTs}
 							label="Max datetimes"
 							on:change={async ({ detail }) => {
@@ -779,6 +950,7 @@
 				<Button size="xs" color="light" variant="border" on:click={reset}>Reset</Button>
 				<ManuelDatePicker
 					on:loadJobs={() => {
+						lastFetchWentToEnd = false
 						jobLoader?.loadJobs(minTs, maxTs, true, true)
 					}}
 					bind:minTs
@@ -809,11 +981,16 @@
 							{isSelectingJobsToCancel}
 							bind:selectedIds
 							bind:selectedWorkspace
+							bind:lastFetchWentToEnd
+							on:loadExtra={loadExtra}
 							on:filterByPath={filterByPath}
 							on:filterByUser={filterByUser}
 							on:filterByFolder={filterByFolder}
 							on:filterByLabel={filterByLabel}
 							on:filterByConcurrencyKey={filterByConcurrencyKey}
+							on:filterByTag={filterByTag}
+							on:filterBySchedule={filterBySchedule}
+							bind:this={runsTable}
 						/>
 					{:else}
 						<div class="gap-1 flex flex-col">
@@ -871,14 +1048,23 @@
 					bind:folder
 					bind:path
 					bind:user
+					bind:label
+					bind:concurrencyKey
+					bind:tag
 					bind:success
 					bind:argFilter
 					bind:resultFilter
 					bind:argError
 					bind:resultError
 					bind:allWorkspaces
+					bind:schedulePath
 					mobile={true}
 					on:change={reloadJobsWithoutFilterError}
+					on:sucessChange={(e) => {
+						if (e.detail == 'running' && maxTs != undefined) {
+							maxTs = undefined
+						}
+					}}
 				/>
 			</div>
 		</div>
@@ -934,16 +1120,22 @@
 			</div>
 			{#if graph === 'RunChart'}
 				<RunChart
+					{lastFetchWentToEnd}
 					bind:selectedIds
 					canSelect={!isSelectingJobsToCancel}
 					minTimeSet={minTs}
 					maxTimeSet={maxTs}
 					maxIsNow={maxTs == undefined}
+					on:loadExtra={loadExtra}
 					jobs={completedJobs}
 					on:zoom={async (e) => {
 						minTs = e.detail.min.toISOString()
 						maxTs = e.detail.max.toISOString()
+						manualDatePicker?.resetChoice()
 						jobLoader?.loadJobs(minTs, maxTs, true)
+					}}
+					on:pointClicked={(e) => {
+						runsTable.scrollToRun(e.detail)
 					}}
 				/>
 			{:else if graph === 'ConcurrencyChart'}
@@ -960,10 +1152,20 @@
 				/>
 			{/if}
 		</div>
-		<div class="flex flex-col gap-4 md:flex-row w-full p-4">
+		<div class="flex flex-col gap-4 md:flex-row w-full p-4 overflow-x-auto">
 			<div class="flex items-center flex-row gap-2 grow">
 				{#if queue_count}
-					<RunsQueue {queue_count} {allWorkspaces} />
+					<RunsQueue
+						{success}
+						{queue_count}
+						{suspended_count}
+						on:jobs_waiting={() => {
+							jobsFilter('waiting')
+						}}
+						on:jobs_suspended={() => {
+							jobsFilter('suspended')
+						}}
+					/>
 				{/if}
 				<div class="flex flex-row">
 					{#if isSelectingJobsToCancel}
@@ -1030,7 +1232,7 @@
 				</div>
 			</div>
 			<div class="flex gap-2 py-1">
-				<div class="relative flex gap-2 items-center pr-8 w-40">
+				<div class="relative flex gap-2 items-center pr-8 w-20">
 					<Toggle
 						size="xs"
 						bind:checked={showSchedules}
@@ -1042,7 +1244,7 @@
 
 					<Calendar size={16} />
 				</div>
-				<div class="relative flex gap-2 items-center pr-8 w-40">
+				<div class="relative flex gap-2 items-center pr-8 w-20">
 					<span class="text-xs absolute -top-4">Planned later</span>
 					<Toggle
 						size="xs"
@@ -1057,10 +1259,11 @@
 			<div class="flex flex-row gap-1 w-full max-w-lg items-center">
 				<div class="relative w-full">
 					<div class="flex gap-1 relative w-full">
-						<span class="text-xs absolute -top-4">Min datetime</span>
+						<span class="text-xs absolute -top-4">Min</span>
 
 						<input
 							type="text"
+							class="min-w-10"
 							value={minTs
 								? new Date(minTs).toLocaleString()
 								: 'zoom x axis to set min (drag with ctrl)'}
@@ -1068,6 +1271,7 @@
 						/>
 
 						<CalendarPicker
+							clearable={true}
 							date={minTs}
 							label="Min datetimes"
 							on:change={async ({ detail }) => {
@@ -1089,13 +1293,15 @@
 				</div>
 				<div class="relative w-full">
 					<div class="flex gap-1 relative w-full">
-						<span class="text-xs absolute -top-4">Max datetime</span>
+						<span class="text-xs absolute -top-4">Max</span>
 						<input
+							class="min-w-10"
 							type="text"
 							value={maxTs ? new Date(maxTs).toLocaleString() : 'zoom x axis to set max'}
 							disabled
 						/>
 						<CalendarPicker
+							clearable={true}
 							date={maxTs}
 							label="Max datetimes"
 							on:change={async ({ detail }) => {
@@ -1120,6 +1326,7 @@
 				<Button size="xs" color="light" variant="border" on:click={reset}>Reset</Button>
 				<ManuelDatePicker
 					on:loadJobs={() => {
+						lastFetchWentToEnd = false
 						jobLoader?.loadJobs(minTs, maxTs, true, true)
 					}}
 					bind:this={manualDatePicker}
@@ -1147,6 +1354,8 @@
 				{isSelectingJobsToCancel}
 				bind:selectedIds
 				bind:selectedWorkspace
+				bind:lastFetchWentToEnd
+				on:loadExtra={loadExtra}
 				on:select={() => {
 					if (!isSelectingJobsToCancel) runDrawer.openDrawer()
 				}}
@@ -1155,6 +1364,8 @@
 				on:filterByFolder={filterByFolder}
 				on:filterByLabel={filterByLabel}
 				on:filterByConcurrencyKey={filterByConcurrencyKey}
+				on:filterByTag={filterByTag}
+				bind:this={runsTable}
 			/>
 		</div>
 	</div>

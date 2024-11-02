@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { base } from '$lib/base'
 	import { Button } from '../common'
 
 	import { getNonStreamingCompletion } from './lib'
@@ -18,7 +19,7 @@
 
 	const dispatch = createEventDispatcher()
 	async function onGenerate() {
-		if (funcDesc.length <= 0) {
+		if (funcDesc?.length <= 0) {
 			return
 		}
 		savePrompt()
@@ -30,7 +31,7 @@
 					{
 						role: 'system',
 						content:
-							'Generate a regex pattern that one can use in a javascript Regex object. Output only the regex itself. The regex should match the following:'
+							'Generate a regex pattern that one can use in a javascript Regex object. Output only the regex itself without any wrapping characters including the / characters. The regex should match the following:'
 					},
 					{
 						role: 'user',
@@ -121,7 +122,7 @@
 						bind:this={input}
 						bind:value={funcDesc}
 						on:keypress={({ key }) => {
-							if (key === 'Enter' && funcDesc.length > 0) {
+							if (key === 'Enter' && funcDesc?.length > 0) {
 								close(input || null)
 								onGenerate()
 							}
@@ -138,7 +139,7 @@
 							close(input || null)
 							onGenerate()
 						}}
-						disabled={funcDesc.length <= 0}
+						disabled={funcDesc?.length <= 0}
 						iconOnly
 						startIcon={{ icon: Wand2 }}
 					/>
@@ -166,7 +167,7 @@
 		{:else}
 			<p class="text-sm">
 				Enable Windmill AI in the <a
-					href="/workspace_settings?tab=openai"
+					href="{base}/workspace_settings?tab=openai"
 					target="_blank"
 					class="inline-flex flex-row items-center gap-1"
 				>

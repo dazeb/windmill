@@ -20,7 +20,7 @@
 	import ResolveStyle from '../helpers/ResolveStyle.svelte'
 	import { initCss } from '../../utils'
 	import ConfirmationModal from '$lib/components/common/confirmationModal/ConfirmationModal.svelte'
-	import Portal from 'svelte-portal'
+	import Portal from '$lib/components/Portal.svelte'
 
 	export let id: string
 	export let componentInput: AppInput | undefined
@@ -244,7 +244,7 @@
 </RunnableWrapper>
 
 {#if resolvedConfig?.confirmationModal?.selected === 'confirmationModal'}
-	<Portal target="#app-editor-top-level-drawer">
+	<Portal name="app-button" target="#app-editor-top-level-drawer">
 		<ConfirmationModal
 			open={Boolean(confirmedCallback)}
 			title={resolvedConfig?.confirmationModal?.configuration?.confirmationModal?.title ?? ''}

@@ -8,20 +8,21 @@
 
 #![allow(non_snake_case)]
 
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::db::ApiAuthed;
 
-use crate::oauth2_ee::{check_nb_of_user, InstanceEvent};
+#[cfg(feature = "enterprise")]
+use crate::ee::ExternalJwks;
+use crate::oauth2_ee::InstanceEvent;
 use crate::utils::{
-    generate_instance_wide_unique_username, get_and_delete_pending_username_or_generate,
-    get_instance_username_or_create_pending,
+    generate_instance_wide_unique_username, get_instance_username_or_create_pending,
 };
 use crate::{
-    db::DB, utils::require_super_admin, webhook_util::WebhookShared,
-    workspaces::invite_user_to_all_auto_invite_worspaces, BASE_URL, COOKIE_DOMAIN, IS_SECURE,
+    db::DB, utils::require_super_admin, webhook_util::WebhookShared, COOKIE_DOMAIN, IS_SECURE,
 };
-use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     async_trait,
     extract::{Extension, FromRequestParts, OriginalUri, Path, Query},
@@ -34,24 +35,26 @@ use chrono::TimeZone;
 use hyper::{header::LOCATION, StatusCode};
 use lazy_static::lazy_static;
 use quick_cache::sync::Cache;
-use rand::rngs::OsRng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use time::OffsetDateTime;
+#[cfg(feature = "enterprise")]
+use tokio::sync::RwLock;
 use tower_cookies::{Cookie, Cookies};
 use tracing::{Instrument, Span};
 use windmill_audit::audit_ee::{audit_log, AuditAuthor};
 use windmill_audit::ActionKind;
+use windmill_common::auth::fetch_authed_from_permissioned_as;
 use windmill_common::global_settings::AUTOMATE_USERNAME_CREATION_SETTING;
-use windmill_common::users::truncate_token;
-use windmill_common::utils::{paginate, send_email};
-use windmill_common::worker::{CLOUD_HOSTED, SERVER_CONFIG};
+use windmill_common::users::{truncate_token, username_to_permissioned_as};
+use windmill_common::utils::paginate;
+use windmill_common::worker::CLOUD_HOSTED;
 use windmill_common::{
     auth::{get_folders_for_user, get_groups_for_user, JWTAuthClaims, JWT_SECRET},
     db::UserDB,
     error::{self, Error, JsonResult, Result},
-    users::{SUPERADMIN_NOTIFICATION_EMAIL, SUPERADMIN_SECRET_EMAIL},
+    users::SUPERADMIN_SECRET_EMAIL,
     utils::{not_found_if_none, rd_string, require_admin, Pagination, StripPath},
 };
 use windmill_git_sync::handle_deployment_metadata;
@@ -104,6 +107,9 @@ pub fn global_service() -> Router {
             post(update_tutorial_progress).get(get_tutorial_progress),
         )
         .route("/leave_instance", post(leave_instance))
+        .route("/export", get(export_global_users))
+        .route("/overwrite", post(overwrite_global_users))
+
     // .route("/list_invite_codes", get(list_invite_codes))
     // .route("/create_invite_code", post(create_invite_code))
     // .route("/signup", post(signup))
@@ -114,25 +120,29 @@ pub fn global_service() -> Router {
 pub fn make_unauthed_service() -> Router {
     Router::new()
         .route("/login", post(login))
-        .route("/logout", post(logout))
-        .route("/logout", get(logout))
+        .route("/logout", post(logout).get(logout))
+        .route("/is_first_time_setup", get(is_first_time_setup))
 }
 
 fn username_override_from_label(label: Option<String>) -> Option<String> {
-    if label.as_ref().is_some_and(|x| x.starts_with("webhook-")) {
-        label
-    } else if label
-        .as_ref()
-        .is_some_and(|x| x.starts_with("ephemeral-script-end-user-"))
-    {
-        Some(
+    match label {
+        Some(label)
+            if label.starts_with("webhook-")
+                || label.starts_with("http-")
+                || label.starts_with("email-") =>
+        {
+            Some(label)
+        }
+        Some(label) if label.starts_with("ephemeral-script-end-user-") => Some(
             label
-                .unwrap()
                 .trim_start_matches("ephemeral-script-end-user-")
                 .to_string(),
-        )
-    } else {
-        None
+        ),
+        Some(label) if label == "Ephemeral lsp token" => Some("lsp".to_string()),
+        Some(label) if label != "ephemeral-script" && label != "session" && !label.is_empty() => {
+            Some(format!("label-{label}"))
+        }
+        _ => None,
     }
 }
 
@@ -141,15 +151,28 @@ pub struct ExpiringAuthCache {
     pub authed: ApiAuthed,
     pub expiry: chrono::DateTime<chrono::Utc>,
 }
+
 pub struct AuthCache {
     cache: Cache<(String, String), ExpiringAuthCache>,
     db: DB,
     superadmin_secret: Option<String>,
+    #[cfg(feature = "enterprise")]
+    ext_jwks: Option<Arc<RwLock<ExternalJwks>>>,
 }
 
 impl AuthCache {
-    pub fn new(db: DB, superadmin_secret: Option<String>) -> Self {
-        AuthCache { cache: Cache::new(300), db, superadmin_secret }
+    pub fn new(
+        db: DB,
+        superadmin_secret: Option<String>,
+        #[cfg(feature = "enterprise")] ext_jwks: Option<Arc<RwLock<ExternalJwks>>>,
+    ) -> Self {
+        AuthCache {
+            cache: Cache::new(300),
+            db,
+            superadmin_secret,
+            #[cfg(feature = "enterprise")]
+            ext_jwks,
+        }
     }
 
     pub async fn invalidate(&self, w_id: &str, token: String) {
@@ -168,9 +191,19 @@ impl AuthCache {
             }
             #[cfg(feature = "enterprise")]
             _ if token.starts_with("jwt_ext_") => {
-                let authed_and_exp =
-                    crate::ee::jwt_ext_auth(w_id.as_ref(), token.trim_start_matches("jwt_ext_"))
-                        .await;
+                let authed_and_exp = match crate::ee::jwt_ext_auth(
+                    w_id.as_ref(),
+                    token.trim_start_matches("jwt_ext_"),
+                    self.ext_jwks.clone(),
+                )
+                .await
+                {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::error!("JWT_EXT auth error: {:?}", e);
+                        None
+                    }
+                };
 
                 if let Some((authed, exp)) = authed_and_exp.clone() {
                     self.cache.insert(
@@ -241,9 +274,10 @@ impl AuthCache {
             _ => {
                 let user_o = sqlx::query_as::<_, (Option<String>, Option<String>, bool, Option<Vec<String>>, Option<String>)>(
                     "UPDATE token SET last_used_at = now() WHERE token = $1 AND (expiration > NOW() \
-                     OR expiration IS NULL) RETURNING owner, email, super_admin, scopes, label",
+                     OR expiration IS NULL) AND (workspace_id IS NULL OR workspace_id = $2) RETURNING owner, email, super_admin, scopes, label",
                 )
                 .bind(token)
+                .bind(w_id.as_ref())
                 .fetch_optional(&self.db)
                 .await
                 .ok()
@@ -476,6 +510,32 @@ pub struct Tokened {
     pub token: String,
 }
 
+struct BruteForceCounter {
+    counter: AtomicU64,
+    last_reset: AtomicI64,
+}
+
+lazy_static! {
+    static ref BRUTE_FORCE_COUNTER: BruteForceCounter =
+        BruteForceCounter { last_reset: AtomicI64::new(0), counter: AtomicU64::new(0) };
+}
+
+impl BruteForceCounter {
+    async fn increment(&self) {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        if self.counter.fetch_add(1, Ordering::Relaxed) > 10000 {
+            tracing::error!(
+                "Brute force attack to find valid token detected, sleeping unauthorized response for 2 seconds"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        if now - self.last_reset.load(Ordering::Relaxed) > 60 {
+            self.counter.store(0, Ordering::Relaxed);
+            self.last_reset.store(now, Ordering::Relaxed);
+        }
+    }
+}
+
 #[async_trait]
 impl<S> FromRequestParts<S> for Tokened
 where
@@ -500,6 +560,7 @@ where
                 parts.extensions.insert(tokened.clone());
                 Ok(tokened)
             } else {
+                BRUTE_FORCE_COUNTER.increment().await;
                 Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_owned()))
             }
         }
@@ -579,7 +640,15 @@ where
             let workspace_id = if path_vec.len() >= 4 && path_vec[0] == "" && path_vec[2] == "w" {
                 Some(path_vec[3].to_owned())
             } else {
-                None
+                if path_vec.len() >= 5
+                    && path_vec[0] == ""
+                    && path_vec[2] == "srch"
+                    && path_vec[3] == "w"
+                {
+                    Some(path_vec[4].to_string())
+                } else {
+                    None
+                }
             };
             if let Some(token) = token_o {
                 if let Ok(Extension(cache)) =
@@ -587,10 +656,14 @@ where
                 {
                     if let Some(authed) = cache.get_authed(workspace_id.clone(), &token).await {
                         parts.extensions.insert(authed.clone());
-                        if authed.scopes.is_some()
-                            && (path_vec.len() < 3
-                                || (path_vec[4] != "jobs" && path_vec[4] != "jobs_u"))
+                        if authed.scopes.as_ref().is_some_and(|scopes| {
+                            scopes
+                                .iter()
+                                .any(|s| s.starts_with("jobs:") || s.starts_with("run:"))
+                        }) && (path_vec.len() < 3
+                            || (path_vec[4] != "jobs" && path_vec[4] != "jobs_u"))
                         {
+                            BRUTE_FORCE_COUNTER.increment().await;
                             return Err((
                                 StatusCode::UNAUTHORIZED,
                                 format!("Unauthorized scoped token: {:?}", authed.scopes),
@@ -606,6 +679,7 @@ where
                     }
                 }
             }
+            BRUTE_FORCE_COUNTER.increment().await;
             Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_owned()))
         }
     }
@@ -615,13 +689,31 @@ pub fn check_scopes<F>(authed: &ApiAuthed, required: F) -> error::Result<()>
 where
     F: FnOnce() -> String,
 {
-    if let Some(scopes) = &authed.scopes {
+    if authed.scopes.as_ref().is_some_and(|scopes| {
+        scopes
+            .iter()
+            .any(|s| s.starts_with("jobs:") || s.starts_with("run:"))
+    }) {
         let req = &required();
-        if !scopes.contains(req) {
+        if !authed.scopes.as_ref().unwrap().contains(req) {
             return Err(Error::BadRequest(format!("missing required scope: {req}")));
         }
     }
     Ok(())
+}
+
+pub fn get_scope_tags(authed: &ApiAuthed) -> Option<Vec<&str>> {
+    authed.scopes.as_ref()?.iter().find_map(|s| {
+        if s.starts_with("if_jobs:filter_tags:") {
+            Some(
+                s.trim_start_matches("if_jobs:filter_tags:")
+                    .split(",")
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        }
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -643,6 +735,28 @@ where
             .map(|authed| Self(Some(authed)))
             .or_else(|_| Ok(Self(None)))
     }
+}
+
+pub async fn fetch_api_authed(
+    username: String,
+    email: String,
+    w_id: &str,
+    db: &DB,
+    username_override: String,
+) -> error::Result<ApiAuthed> {
+    let permissioned_as = username_to_permissioned_as(username.as_str());
+    let authed =
+        fetch_authed_from_permissioned_as(permissioned_as, email.clone(), w_id, db).await?;
+    Ok(ApiAuthed {
+        username: username,
+        email: email,
+        is_admin: authed.is_admin,
+        is_operator: authed.is_operator,
+        groups: authed.groups,
+        folders: authed.folders,
+        scopes: authed.scopes,
+        username_override: Some(username_override),
+    })
 }
 
 #[derive(FromRow, Serialize)]
@@ -672,6 +786,8 @@ pub struct GlobalUserInfo {
     name: Option<String>,
     company: Option<String>,
     username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operator_only: Option<bool>,
 }
 
 #[derive(Serialize, Debug)]
@@ -699,6 +815,7 @@ pub struct WorkspaceInvite {
     pub operator: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct NewUser {
     pub email: String,
@@ -722,6 +839,7 @@ pub struct DeclineInvite {
 #[derive(Deserialize)]
 pub struct EditUser {
     pub is_super_admin: Option<bool>,
+    pub name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -731,6 +849,7 @@ pub struct EditWorkspaceUser {
     pub disabled: Option<bool>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct EditPassword {
     pub password: String,
@@ -752,12 +871,55 @@ pub struct NewToken {
     pub expiration: Option<chrono::DateTime<chrono::Utc>>,
     pub impersonate_email: Option<String>,
     pub scopes: Option<Vec<String>>,
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct Login {
     pub email: String,
     pub password: String,
+}
+
+lazy_static::lazy_static! {
+    static ref FIRST_TIME_SETUP: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
+}
+
+pub async fn is_first_time_setup(Extension(db): Extension<DB>) -> JsonResult<bool> {
+    if !FIRST_TIME_SETUP.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(Json(false));
+    }
+    let single_user = sqlx::query_scalar!("SELECT 1 FROM password LIMIT 2")
+        .fetch_all(&db)
+        .await
+        .ok()
+        .unwrap_or_default()
+        .len()
+        == 1;
+    if single_user {
+        let user_is_admin_and_password_changeme = sqlx::query_scalar!(
+            "SELECT 1 FROM password WHERE email = 'admin@windmill.dev' AND password_hash = '$argon2id$v=19$m=4096,t=3,p=1$oLJo/lPn/gezXCuFOEyaNw$i0T2tCkw3xUFsrBIKZwr8jVNHlIfoxQe+HfDnLtd12I'"
+        ).fetch_all(&db)
+        .await
+        .ok()
+        .unwrap_or_default()
+        .len() == 1;
+        if user_is_admin_and_password_changeme {
+            let base_url_is_not_set =
+                sqlx::query_scalar!("SELECT COUNT(*) FROM global_settings WHERE name = 'base_url'")
+                    .fetch_optional(&db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .flatten()
+                    .unwrap_or(0)
+                    == 0;
+            if base_url_is_not_set {
+                return Ok(Json(true));
+            }
+        }
+    }
+    FIRST_TIME_SETUP.store(false, std::sync::atomic::Ordering::Relaxed);
+    Ok(Json(false))
 }
 
 #[derive(Deserialize)]
@@ -840,24 +1002,48 @@ async fn list_user_usage(
     Ok(Json(rows))
 }
 
+#[derive(Deserialize)]
+struct ActiveUsersOnly {
+    active_only: Option<bool>,
+}
+
 async fn list_users_as_super_admin(
     authed: ApiAuthed,
     Extension(db): Extension<DB>,
     Query(pagination): Query<Pagination>,
+    Query(ActiveUsersOnly { active_only }): Query<ActiveUsersOnly>,
 ) -> JsonResult<Vec<GlobalUserInfo>> {
     require_super_admin(&db, &authed.email).await?;
     let per_page = pagination.per_page.unwrap_or(10000).max(1);
     let offset = (pagination.page.unwrap_or(1).max(1) - 1) * per_page;
 
-    let rows = sqlx::query_as!(
-        GlobalUserInfo,
-        "SELECT email, login_type::text, verified, super_admin, name, company, username from password ORDER BY super_admin DESC, email LIMIT \
-         $1 OFFSET $2",
-        per_page as i32,
-        offset as i32
-    )
-    .fetch_all(&db)
-    .await?;
+    let rows = if active_only.is_some_and(|x| x) {
+        sqlx::query_as!(
+            GlobalUserInfo,
+            "WITH active_users AS (SELECT distinct username as email FROM audit WHERE timestamp > NOW() - INTERVAL '1 month' AND (operation = 'users.login' OR operation = 'oauth.login')),
+            authors as (SELECT distinct email FROM usr WHERE usr.operator IS false)
+            SELECT email, email NOT IN (SELECT email FROM authors) as operator_only, login_type::text, verified, super_admin, name, company, username
+            FROM password
+            WHERE email IN (SELECT email FROM active_users)
+            ORDER BY super_admin DESC
+            LIMIT $1 OFFSET $2",
+            per_page as i32,
+            offset as i32
+        )
+        .fetch_all(&db)
+        .await?
+    } else {
+        sqlx::query_as!(
+            GlobalUserInfo,
+            "SELECT email, login_type::text, verified, super_admin, name, company, username, NULL::bool as operator_only FROM password ORDER BY super_admin DESC, email LIMIT \
+            $1 OFFSET $2",
+            per_page as i32,
+            offset as i32
+        )
+        .fetch_all(&db)
+        .await?
+    };
+
     Ok(Json(rows))
 }
 
@@ -1012,7 +1198,7 @@ async fn global_whoami(
 ) -> JsonResult<GlobalUserInfo> {
     let user = sqlx::query_as!(
         GlobalUserInfo,
-        "SELECT email, login_type::TEXT, super_admin, verified, name, company, username FROM password WHERE \
+        "SELECT email, login_type::TEXT, super_admin, verified, name, company, username, NULL::bool as operator_only FROM password WHERE \
          email = $1",
         email
     )
@@ -1031,6 +1217,7 @@ async fn global_whoami(
             name: None,
             company: None,
             username: None,
+            operator_only: None,
         }))
     } else {
         Err(user.unwrap_err())
@@ -1669,6 +1856,16 @@ async fn update_user(
         .await?;
     }
 
+    if let Some(n) = eu.name {
+        sqlx::query_scalar!(
+            "UPDATE password SET name = $1 WHERE email = $2",
+            n,
+            &email_to_update
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+
     audit_log(
         &mut *tx,
         &authed,
@@ -1743,114 +1940,9 @@ async fn create_user(
     Extension(webhook): Extension<WebhookShared>,
     Extension(argon2): Extension<Arc<Argon2<'_>>>,
     Extension(rsmq): Extension<Option<rsmq_async::MultiplexedRsmq>>,
-    Json(mut nu): Json<NewUser>,
+    Json(nu): Json<NewUser>,
 ) -> Result<(StatusCode, String)> {
-    require_super_admin(&db, &authed.email).await?;
-    let mut tx = db.begin().await?;
-
-    nu.email = nu.email.to_lowercase();
-
-    if nu.email == SUPERADMIN_SECRET_EMAIL || nu.email == SUPERADMIN_NOTIFICATION_EMAIL {
-        return Err(Error::BadRequest("This email address is reserved".into()));
-    }
-
-    check_nb_of_user(&db).await?;
-
-    let already_exists = sqlx::query_scalar!(
-        "SELECT EXISTS (SELECT 1 FROM password WHERE email = $1)",
-        &nu.email
-    )
-    .fetch_one(&mut *tx)
-    .await?
-    .unwrap_or(false);
-
-    if already_exists {
-        return Err(Error::BadRequest(format!(
-            "an account with the email {} already exists",
-            nu.email
-        )));
-    }
-
-    let automate_username_creation = sqlx::query_scalar!(
-        "SELECT value FROM global_settings WHERE name = $1",
-        AUTOMATE_USERNAME_CREATION_SETTING,
-    )
-    .fetch_optional(&mut *tx)
-    .await?
-    .map(|v| v.as_bool())
-    .flatten()
-    .unwrap_or(false);
-
-    let mut username = None;
-    if automate_username_creation {
-        username = Some(get_and_delete_pending_username_or_generate(&mut tx, &nu.email).await?);
-    }
-
-    sqlx::query!(
-        "INSERT INTO password(email, verified, password_hash, login_type, super_admin, name, \
-         company, username)
-    VALUES ($1, $2, $3, 'password', $4, $5, $6, $7)",
-        &nu.email,
-        true,
-        &hash_password(argon2, nu.password.clone())?,
-        &nu.super_admin,
-        nu.name,
-        nu.company,
-        username
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    audit_log(
-        &mut *tx,
-        &authed,
-        "users.add_global",
-        ActionKind::Create,
-        "global",
-        Some(&nu.email),
-        None,
-    )
-    .await?;
-    tx = add_to_demo_if_exists(tx, &nu.email).await?;
-
-    tx.commit().await?;
-
-    invite_user_to_all_auto_invite_worspaces(&db, &nu.email, rsmq, &authed).await?;
-    send_email_if_possible(
-        "Invited to Windmill",
-        &format!(
-            "You have been granted access to Windmill by {}.
-
-Log in and change your password: {}/user/login?email={}&password={}&rd=%2F%23user-settings
-
-You can then join or create a workspace. Happy building!",
-            authed.email,
-            BASE_URL.read().await.clone(),
-            &nu.email,
-            &nu.password
-        ),
-        &nu.email,
-    );
-    webhook.send_instance_event(InstanceEvent::UserAdded { email: nu.email.clone() });
-    Ok((StatusCode::CREATED, format!("email {} created", nu.email)))
-}
-
-pub fn send_email_if_possible(subject: &str, content: &str, to: &str) {
-    let subject = subject.to_string();
-    let content = content.to_string();
-    let to = to.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = send_email_if_possible_intern(&subject, &content, to.clone()).await {
-            tracing::error!("Failed to send email to {}: {}", to, e);
-        }
-    });
-}
-
-pub async fn send_email_if_possible_intern(subject: &str, content: &str, to: String) -> Result<()> {
-    if let Some(smtp) = SERVER_CONFIG.read().await.smtp.clone() {
-        send_email(subject, content, vec![to], smtp, None).await?;
-    }
-    return Ok(());
+    crate::users_ee::create_user(authed, db, webhook, argon2, rsmq, nu).await
 }
 
 async fn delete_workspace_user(
@@ -1923,193 +2015,10 @@ async fn set_password(
     Extension(db): Extension<DB>,
     Extension(argon2): Extension<Arc<Argon2<'_>>>,
     authed: ApiAuthed,
-    Json(EditPassword { password }): Json<EditPassword>,
+    Json(ep): Json<EditPassword>,
 ) -> Result<String> {
-    let mut tx = db.begin().await?;
-
-    let custom_type = sqlx::query_scalar!(
-        "SELECT login_type::TEXT FROM password WHERE email = $1",
-        &authed.email
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| Error::InternalErr(format!("setting password: {e:#}")))?
-    .unwrap_or("".to_string());
-
-    if custom_type != "password".to_string() {
-        return Err(Error::BadRequest(format!(
-            "login type for {} is of type {custom_type}. Cannot set password.",
-            authed.email
-        )));
-    }
-
-    sqlx::query!(
-        "UPDATE password SET password_hash = $1 WHERE email = $2",
-        &hash_password(argon2, password)?,
-        &authed.email,
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    audit_log(
-        &mut *tx,
-        &authed,
-        "users.setpassword",
-        ActionKind::Update,
-        "global",
-        Some(&authed.email),
-        None,
-    )
-    .await?;
-    tx.commit().await?;
-
-    Ok(format!("password of {} updated", authed.email))
+    crate::users_ee::set_password(db, argon2, authed, ep).await
 }
-
-pub fn hash_password(argon2: Arc<Argon2>, password: String) -> Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
-    let password_hash = argon2
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| Error::InternalErr(e.to_string()))?
-        .to_string();
-    Ok(password_hash)
-}
-
-// async fn lost_password(
-//     Extension(db): Extension<DB>,
-//     Extension(es): Extension<Arc<EmailSender>>,
-//     TypedHeader(host): TypedHeader<headers::Host>,
-//     Json(LostPassword {
-//         email
-//     }): Json<LostPassword>,
-// ) -> Result<String> {
-//     let mut tx = db.begin().await?;
-
-//     let exists = sqlx::query_scalar!(
-//             "SELECT EXISTS(SELECT 1 FROM password WHERE email = $1)",
-//         &email)
-//         .fetch_one(&mut tx)
-//         .await?
-//         .unwrap_or(false);
-
-//     if !exists {
-//         return Err(Error::NotFound(format!("no user found at email {email}")))
-//     }
-
-//     let already = sqlx::query_scalar!(
-//             "SELECT EXISTS(SELECT 1 FROM magic_link WHERE email = $1)",
-//         &email)
-//         .fetch_one(&mut tx)
-//         .await?
-//         .unwrap_or(false);
-
-//     if already {
-//         return Err(Error::BadRequest(format!("a magic link was already sent at {email}")))
-//     }
-
-//     let tx = create_magic_link(&host.hostname(), &email, &es, tx).await?;
-//     tx.commit().await?;
-
-//     Ok(format!("Magic link sent to {email}"))
-// }
-
-// async fn use_magic_link(
-//     cookies: Cookies,
-//     Extension(db): Extension<DB>,
-//     Query(UseMagicLink {
-//         email,
-//         token
-//     }): Query<UseMagicLink>,
-// ) -> Result<String> {
-//     let mut tx = db.begin().await?;
-
-//     let email_o = sqlx::query_scalar!(
-//         "DELETE FROM magic_link WHERE email = $1 AND token = $2
-//         RETURNING email", email, token
-//     )
-//     .fetch_optional(&mut tx)
-//     .await?;
-
-//     if let Some(email) = email_o {
-//         let is_super_admin = sqlx::query_scalar!("UPDATE password SET verified = true WHERE email = $1 RETURNING super_admin", email)
-//             .fetch_optional(&mut tx)
-//             .await?
-//             .unwrap_or(false);
-
-//         let token = create_session_token(&email, is_super_admin, &mut tx, cookies).await?;
-//         tx.commit().await?;
-//         Ok(token)
-//     } else {
-//         Err(Error::NotFound(format!("magic link for {email} not found")))
-//     }
-// }
-
-// async fn signup(
-//     TypedHeader(host): TypedHeader<headers::Host>,
-//     Extension(db): Extension<DB>,
-//     Extension(argon2): Extension<Arc<Argon2<'_>>>,
-//     Extension(es): Extension<Arc<EmailSender>>,
-//     Json(Signup {
-//         email,
-//         password,
-//         name,
-//         company
-//     }): Json<Signup>,
-// ) -> Result<(StatusCode, String)> {
-//     let mut tx = db.begin().await?;
-
-//     let email = sqlx::query_scalar!(
-//             "INSERT INTO password (email, password_hash, name, company) VALUES ($1, $2, $3, $4) RETURNING email",
-//         &email, &hash_password(argon2, password)?, name, company)
-//         .fetch_optional(&mut tx)
-//         .await?;
-
-//     if let Some(email) = email {
-//         let tx = create_magic_link(&host.hostname(), &email, &es, tx).await?;
-//         tx.commit().await?;
-
-//         Ok((
-//             StatusCode::CREATED,
-//             format!("user with email {} created", email),
-//         ))
-//     } else {
-//         Err(Error::BadRequest("Invalid login".to_string()))
-//     }
-// }
-
-// async fn create_magic_link<'c>(host: &str, email: &str, es: &EmailSender, mut tx: sqlx::Transaction<'c, sqlx::Postgres>) -> error::Result<sqlx::Transaction<'c, sqlx::Postgres>> {
-//     let token = gen_token();
-
-//     sqlx::query!(
-//         "INSERT INTO magic_link
-//             (email, token)
-//             VALUES ($1, $2)",
-//         email,
-//         &token
-//     )
-//     .execute(&mut tx)
-//     .await?;
-
-//     let encoded_token = urlencoding::encode(&token);
-//     let encoded_email = urlencoding::encode(email);
-//     es.send_email(Message::builder()
-//         .to(email.parse().unwrap())
-//         .subject("New magic link")
-//         .body(format!("Magic link: https://{host}/magic_link?token={encoded_token}&email={encoded_email}"))
-//         .unwrap()).await?;
-
-//     audit_log(
-//          &mut tx,
-//         email,
-//         "users.magic_link",
-//         ActionKind::Create,
-//         "global",
-//         Some(email),
-//         None,
-//     )
-//     .await?;
-//     Ok(tx)
-// }
 
 async fn login(
     cookies: Cookies,
@@ -2119,6 +2028,8 @@ async fn login(
 ) -> Result<String> {
     let mut tx = db.begin().await?;
     let email = email.to_lowercase();
+    let audit_author =
+        AuditAuthor { email: email.clone(), username: email.clone(), username_override: None };
     let email_w_h: Option<(String, String, bool, bool)> = sqlx::query_as(
         "SELECT email, password_hash, super_admin, first_time_user FROM password WHERE email = $1 AND login_type = \
          'password'",
@@ -2134,6 +2045,16 @@ async fn login(
             .verify_password(password.as_bytes(), &parsed_hash)
             .is_err()
         {
+            audit_log(
+                &mut *tx,
+                &audit_author,
+                "users.login_failure",
+                ActionKind::Create,
+                "global",
+                None,
+                None,
+            )
+            .await?;
             Err(Error::BadRequest("Invalid login".to_string()))
         } else {
             if first_time_user {
@@ -2159,11 +2080,7 @@ async fn login(
 
             audit_log(
                 &mut *tx,
-                &AuditAuthor {
-                    username: email.clone(),
-                    email: email.clone(),
-                    username_override: None,
-                },
+                &audit_author,
                 "users.login",
                 ActionKind::Create,
                 "global",
@@ -2176,6 +2093,16 @@ async fn login(
             Ok(token)
         }
     } else {
+        audit_log(
+            &mut *tx,
+            &audit_author,
+            "users.login_failure",
+            ActionKind::Create,
+            "global",
+            None,
+            None,
+        )
+        .await?;
         Err(Error::BadRequest("Invalid login".to_string()))
     }
 }
@@ -2252,14 +2179,15 @@ async fn create_token(
     .unwrap_or(false);
     sqlx::query!(
         "INSERT INTO token
-            (token, email, label, expiration, super_admin, scopes)
-            VALUES ($1, $2, $3, $4, $5, $6)",
+            (token, email, label, expiration, super_admin, scopes, workspace_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)",
         token,
         authed.email,
         new_token.label,
         new_token.expiration,
         is_super_admin,
-        new_token.scopes.as_ref().map(|x| x.as_slice())
+        new_token.scopes.as_ref().map(|x| x.as_slice()),
+        new_token.workspace_id,
     )
     .execute(&mut *tx)
     .await?;
@@ -2478,7 +2406,11 @@ async fn get_all_runnables(
             })?;
         let mut tx = db.clone().begin(&nauthed).await?;
         let flows = sqlx::query!(
-            "SELECT workspace_id as workspace, path, summary, description, schema FROM flow WHERE workspace_id = $1", workspace
+            "SELECT flow.workspace_id as workspace, flow.path, summary, description, flow_version.schema 
+            FROM flow 
+            LEFT JOIN flow_version ON flow_version.id = flow.versions[array_upper(flow.versions, 1)]
+            WHERE flow.workspace_id = $1",
+            workspace
         )
         .fetch_all(&mut *tx)
         .await?;
@@ -2547,32 +2479,6 @@ pub struct LoginUserInfo {
     pub displayName: Option<String>,
 }
 
-pub async fn add_to_demo_if_exists<'c>(
-    mut tx: sqlx::Transaction<'c, sqlx::Postgres>,
-    email: &String,
-) -> Result<sqlx::Transaction<'c, sqlx::Postgres>> {
-    let demo_exists =
-        sqlx::query_scalar!("SELECT EXISTS(SELECT 1 FROM workspace WHERE id = 'demo')")
-            .fetch_one(&mut *tx)
-            .await?
-            .unwrap_or(false);
-    if demo_exists {
-        if let Err(e) = sqlx::query!(
-            "INSERT INTO workspace_invite
-                (workspace_id, email, is_admin)
-                VALUES ('demo', $1, false)
-                ON CONFLICT DO NOTHING",
-            &email
-        )
-        .execute(&mut *tx)
-        .await
-        {
-            tracing::error!("error inserting invite: {:#?}", e);
-        }
-    }
-    return Ok(tx);
-}
-
 #[derive(Serialize)]
 struct InstanceUsernameInfo {
     username: String,
@@ -2631,6 +2537,106 @@ async fn username_to_email(
     let email = not_found_if_none(email, "user", username)?;
 
     Ok(email)
+}
+
+#[cfg(feature = "enterprise")]
+#[derive(Serialize, Deserialize)]
+struct ExportedGlobalUser {
+    email: String,
+    password_hash: Option<String>,
+    login_type: String,
+    super_admin: bool,
+    verified: bool,
+    name: Option<String>,
+    company: Option<String>,
+    first_time_user: bool,
+    username: Option<String>,
+}
+
+#[cfg(feature = "enterprise")]
+async fn export_global_users(
+    Extension(db): Extension<DB>,
+    authed: ApiAuthed,
+) -> JsonResult<Vec<ExportedGlobalUser>> {
+    require_super_admin(&db, &authed.email).await?;
+    let mut tx = db.begin().await?;
+    let users = sqlx::query_as!(
+        ExportedGlobalUser,
+        "SELECT email, password_hash, login_type, super_admin, verified, name, company, first_time_user, username FROM password"
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    audit_log(
+        &mut *tx,
+        &authed,
+        "users.export_export",
+        ActionKind::Execute,
+        "global",
+        None,
+        None,
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(Json(users))
+}
+
+#[cfg(not(feature = "enterprise"))]
+async fn export_global_users() -> JsonResult<String> {
+    Err(Error::BadRequest(
+        "This feature is only available in the enterprise version".to_string(),
+    ))
+}
+
+#[cfg(feature = "enterprise")]
+async fn overwrite_global_users(
+    Extension(db): Extension<DB>,
+    authed: ApiAuthed,
+    Json(users): Json<Vec<ExportedGlobalUser>>,
+) -> Result<String> {
+    require_super_admin(&db, &authed.email).await?;
+    let mut tx = db.begin().await?;
+    sqlx::query!("DELETE FROM password")
+        .execute(&mut *tx)
+        .await?;
+    for user in users {
+        sqlx::query!(
+            "INSERT INTO password(email, password_hash, login_type, super_admin, verified, name, company, first_time_user, username)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            user.email,
+            user.password_hash,
+            user.login_type,
+            user.super_admin,
+            user.verified,
+            user.name,
+            user.company,
+            user.first_time_user,
+            user.username
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    audit_log(
+        &mut *tx,
+        &authed,
+        "users.import_global",
+        ActionKind::Create,
+        "global",
+        None,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok("loaded global users".to_string())
+}
+
+#[cfg(not(feature = "enterprise"))]
+async fn overwrite_global_users() -> JsonResult<String> {
+    Err(Error::BadRequest(
+        "This feature is only available in the enterprise version".to_string(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -2918,7 +2924,19 @@ async fn update_username_in_workpsace<'c>(
 
     // ---- flows ----
     sqlx::query!(
-        r#"UPDATE flow SET path = REGEXP_REPLACE(path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        r#"INSERT INTO flow
+            (workspace_id, path, summary, description, archived, extra_perms, dependency_job, draft_only, tag, ws_error_handler_muted, dedicated_worker, timeout, visible_to_runner_only, concurrency_key, versions, value, schema, edited_by, edited_at) 
+        SELECT workspace_id, REGEXP_REPLACE(path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1'), summary, description, archived, extra_perms, dependency_job, draft_only, tag, ws_error_handler_muted, dedicated_worker, timeout, visible_to_runner_only, concurrency_key, versions, value, schema, edited_by, edited_at
+            FROM flow 
+            WHERE path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
+        new_username,
+        old_username,
+        w_id
+    ).execute(&mut **tx)
+    .await?;
+
+    sqlx::query!(
+        r#"UPDATE flow_version SET path = REGEXP_REPLACE(path,'u/' || $2 || '/(.*)','u/' || $1 || '/\1') WHERE path LIKE ('u/' || $2 || '/%') AND workspace_id = $3"#,
         new_username,
         old_username,
         w_id
@@ -2927,14 +2945,12 @@ async fn update_username_in_workpsace<'c>(
     .await?;
 
     sqlx::query!(
-        "UPDATE flow SET edited_by = $1 WHERE edited_by = $2 AND workspace_id = $3",
-        new_username,
+        "DELETE FROM flow WHERE path LIKE ('u/' || $1 || '/%') AND workspace_id = $2",
         old_username,
         w_id
     )
     .execute(&mut **tx)
-    .await
-    .unwrap();
+    .await?;
 
     sqlx::query!(
         "UPDATE flow SET extra_perms = extra_perms - ('u/' || $2) || jsonb_build_object(('u/' || $1), extra_perms->('u/' || $2)) WHERE extra_perms ? ('u/' || $2) AND workspace_id = $3",

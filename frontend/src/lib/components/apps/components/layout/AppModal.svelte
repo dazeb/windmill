@@ -7,7 +7,8 @@
 	import { twMerge } from 'tailwind-merge'
 	import { initConfig, initOutput, maxHeight, ROW_GAP_Y, ROW_HEIGHT } from '../../editor/appUtils'
 	import InitializeComponent from '../helpers/InitializeComponent.svelte'
-	import Portal from 'svelte-portal'
+	import Portal from '$lib/components/Portal.svelte'
+
 	import { clickOutside } from '$lib/utils'
 	import { X } from 'lucide-svelte'
 	import { components } from '../../editor/component'
@@ -144,7 +145,7 @@
 		</AlignWrapper>
 	</div>
 {/if}
-<Portal target="#app-editor-top-level-drawer">
+<Portal target="#app-editor-top-level-drawer" name="app-modal">
 	<Disposable
 		{id}
 		let:handleClickAway
